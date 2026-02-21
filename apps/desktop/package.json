@@ -1,0 +1,51 @@
+{
+  "name": "desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"tsc -p electron/tsconfig.json --watch\" \"wait-on tcp:5173 && electron .\"",
+    "build": "vite build && tsc -p electron/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "lint": "echo 'no lint configured'",
+    "dist:win": "pnpm build && electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.overlay.editor",
+    "productName": "Overlay Profile Editor",
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "build"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "dependencies": {
+    "@overlay/shared": "workspace:*",
+    "@supabase/supabase-js": "^2.46.0",
+    "konva": "^9.3.15",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-konva": "^18.2.10",
+    "react-router-dom": "^6.27.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/react": "^18.3.9",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "concurrently": "^9.0.1",
+    "electron": "^32.1.2",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "wait-on": "^8.0.1"
+  }
+}

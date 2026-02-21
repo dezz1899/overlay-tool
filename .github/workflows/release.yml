@@ -1,0 +1,26 @@
+name: release-windows
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @overlay/shared build
+      - run: pnpm --filter renderer build
+      - run: pnpm --filter desktop dist:win
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: apps/desktop/dist/*.exe

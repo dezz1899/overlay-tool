@@ -1,0 +1,12 @@
+:root { font-family: Inter, system-ui, sans-serif; color: #e6eef8; background: #10131a; }
+* { box-sizing: border-box; }
+body,html,#root { margin:0; height:100%; }
+.layout { display:grid; grid-template-columns: 280px 1fr 300px; height:100vh; }
+.panel { border-right:1px solid #2a3444; padding:12px; overflow:auto; }
+.panel.right { border-right:none; border-left:1px solid #2a3444; }
+button,input,select,textarea { width:100%; margin-top:8px; background:#1b2533; color:#fff; border:1px solid #2d3d54; padding:8px; border-radius:6px; }
+.canvas-wrap { display:flex; align-items:center; justify-content:center; background:#0b0f15; }
+.badge { background:#2a3444; border-radius:999px; padding:2px 8px; font-size:12px; }
+.warning { color:#ffcc75; font-size:12px; }
+.row { display:flex; gap:8px; }
+.row > * { flex:1; }
