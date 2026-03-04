@@ -156,7 +156,7 @@ wss.on("connection", async (socket, req) => {
   // safety
   try {
     (socket as any).close();
-  } catch {}
+  } catch { }
 });
 
 // ============================
@@ -209,7 +209,7 @@ const conns = new Map<string, TwitchConn>();
 function sendJSON(ws: WebSocket, obj: any) {
   try {
     ws.send(JSON.stringify(obj));
-  } catch {}
+  } catch { }
 }
 
 function broadcast(conn: TwitchConn, obj: any) {
@@ -217,7 +217,7 @@ function broadcast(conn: TwitchConn, obj: any) {
   for (const c of conn.clients) {
     try {
       c.send(msg);
-    } catch {}
+    } catch { }
   }
 }
 
@@ -226,7 +226,7 @@ function stopConnIfIdle(conn: TwitchConn) {
   // no clients -> close IRC + stop polling
   try {
     conn.irc?.close();
-  } catch {}
+  } catch { }
   conn.irc = null;
 
   if (conn.pollTimer) {
@@ -282,7 +282,7 @@ function connectTwitch(conn: TwitchConn) {
         const payload = line.slice(5);
         try {
           irc.send("PONG " + payload);
-        } catch {}
+        } catch { }
         continue;
       }
 
@@ -329,6 +329,15 @@ function connectTwitch(conn: TwitchConn) {
         text,
         color,
         ts: Date.now(),
+
+        // ✅ wichtig für Twitch-Emotes (Positions im Text)
+        emotes: tags["emotes"] || "",
+
+        // (optional für später: badges)
+        badges: tags["badges"] || "",
+        badge_info: tags["badge-info"] || "",
+        user_id: tags["user-id"] || "",
+        room_id: tags["room-id"] || "",
       });
     }
   };
@@ -415,7 +424,7 @@ async function ensureProfilePolling(conn: TwitchConn, profileId: string) {
       broadcast(conn, { type: "info", msg: "reconnect triggered" });
       try {
         conn.irc?.close();
-      } catch {}
+      } catch { }
     }
   }, POLL_MS);
 }
