@@ -20,6 +20,11 @@ const TWITCH_DEFAULT_CHANNEL = String(process.env.TWITCH_DEFAULT_CHANNEL ?? "").
 const POLL_MS = Math.max(3000, Number(process.env.TWITCH_POLL_MS ?? 8000)); // reconnect/channel change polling
 const ASSET_TTL_MS = Math.max(60_000, Number(process.env.ASSET_TTL_MS ?? 10 * 60 * 1000)); // 10min default
 const UA = "overlay-tool-chat-gateway/1.0";
+const TWITCH_CLIENT_ID = String(process.env.TWITCH_CLIENT_ID ?? "").trim();
+const TWITCH_CLIENT_SECRET = String(process.env.TWITCH_CLIENT_SECRET ?? "").trim();
+
+let twitchAppToken: string | null = null;
+let twitchTokenExpMs = 0;
 let lastBadgeError: string | null = null;
 let lastBadgeGlobalCount = 0;
 let lastBadgeChannelCount = 0;
@@ -121,6 +126,50 @@ async function httpJson(url: string) {
   return res.json();
 }
 
+async function getTwitchAppToken(): Promise<string> {
+  const now = Date.now();
+  if (twitchAppToken && now < twitchTokenExpMs - 60_000) return twitchAppToken; // refresh 60s early
+
+  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) {
+    throw new Error("Missing TWITCH_CLIENT_ID or TWITCH_CLIENT_SECRET");
+  }
+
+  const body = new URLSearchParams({
+    client_id: TWITCH_CLIENT_ID,
+    client_secret: TWITCH_CLIENT_SECRET,
+    grant_type: "client_credentials",
+  });
+
+  const res = await fetch("https://id.twitch.tv/oauth2/token", { method: "POST", body });
+  const j: any = await res.json().catch(() => ({}));
+
+  if (!res.ok) throw new Error(`token fetch failed ${res.status}: ${JSON.stringify(j).slice(0, 200)}`);
+
+  const token = String(j.access_token ?? "");
+  const expiresIn = Number(j.expires_in ?? 0);
+  if (!token) throw new Error("token missing in response");
+
+  twitchAppToken = token;
+  twitchTokenExpMs = Date.now() + Math.max(300, expiresIn) * 1000;
+  return token;
+}
+
+async function helixJson(path: string): Promise<any> {
+  const token = await getTwitchAppToken();
+
+  const res = await fetch(`https://api.twitch.tv/helix/${path}`, {
+    headers: {
+      "Client-Id": TWITCH_CLIENT_ID,
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
+  });
+
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`helix ${path} failed ${res.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  return j;
+}
+
 function parseBadgeSetsToMap(j: any): BadgeMap {
   const out: BadgeMap = {};
   const sets = j?.badge_sets ?? {};
@@ -135,26 +184,34 @@ function parseBadgeSetsToMap(j: any): BadgeMap {
   return out;
 }
 
+function parseHelixBadgesToMap(j: any): BadgeMap {
+  // helix shape: { data: [ { set_id, versions:[{id, image_url_2x, image_url_1x ...}]} ] }
+  const out: BadgeMap = {};
+  const data = Array.isArray(j?.data) ? j.data : [];
+  for (const set of data) {
+    const setId = String(set?.set_id ?? "");
+    const versions = Array.isArray(set?.versions) ? set.versions : [];
+    for (const v of versions) {
+      const ver = String(v?.id ?? "");
+      const url = String(v?.image_url_2x ?? v?.image_url_1x ?? "");
+      if (!setId || !ver || !url) continue;
+      out[`${setId}/${ver}`] = url;
+    }
+  }
+  return out;
+}
+
 async function loadGlobalBadges(): Promise<BadgeMap> {
-  const url = "https://badges.twitch.tv/v1/badges/global/display?language=en";
-  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`global badges fetch failed ${res.status}: ${txt.slice(0, 160)}`);
-  const j = JSON.parse(txt);
-  const map = parseBadgeSetsToMap(j);
-  if (Object.keys(map).length === 0) throw new Error(`global badges parsed 0 keys; topKeys=${Object.keys(j || {}).join(",")}`);
+  const j = await helixJson("chat/badges/global");
+  const map = parseHelixBadgesToMap(j);
+  if (Object.keys(map).length === 0) throw new Error("helix global badges parsed 0 keys");
   return map;
 }
 
 async function loadChannelBadges(roomId: string): Promise<BadgeMap> {
-  const url = `https://badges.twitch.tv/v1/badges/channels/${encodeURIComponent(roomId)}/display?language=en`;
-  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`channel badges fetch failed ${res.status}: ${txt.slice(0, 160)}`);
-  const j = JSON.parse(txt);
-  const map = parseBadgeSetsToMap(j);
-  // channel badges können bei neuen/kleinen channels leer sein, aber meistens nicht
-  return map;
+  // roomId kommt aus IRC tag "room-id" und ist Twitch broadcaster_id
+  const j = await helixJson(`chat/badges?broadcaster_id=${encodeURIComponent(roomId)}`);
+  return parseHelixBadgesToMap(j);
 }
 
 async function ensureBadgesForChannel(channel: string, roomId?: string): Promise<BadgeMap> {
