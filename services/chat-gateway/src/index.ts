@@ -14,154 +14,12 @@ const supabase = hasSupabase ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_
 
 // ===== Twitch defaults =====
 const TWITCH_DEFAULT_CHANNEL = String(process.env.TWITCH_DEFAULT_CHANNEL ?? "").trim().toLowerCase(); // optional
-const POLL_MS = Math.max(3000, Number(process.env.TWITCH_POLL_MS ?? 8000)); // poll profile config for reconnect/channel change
+const POLL_MS = Math.max(3000, Number(process.env.TWITCH_POLL_MS ?? 8000)); // reconnect/channel change polling
+const ASSET_TTL_MS = Math.max(60_000, Number(process.env.ASSET_TTL_MS ?? 10 * 60 * 1000)); // 10min default
+const UA = "overlay-tool-chat-gateway/1.0";
 
-function uid() {
-  return Math.random().toString(16).slice(2) + Date.now().toString(16);
-}
-
-const app = express();
-
-app.get("/health", async (_req, res) => {
-  let supabaseOk = false;
-  let supabaseError: string | null = null;
-
-  if (supabase) {
-    const { error } = await supabase.from("profiles").select("id").limit(1);
-    supabaseOk = !error;
-    supabaseError = error ? (error.message || JSON.stringify(error)) : null;
-  }
-
-  res.json({ ok: true, hasSupabase, supabaseOk, supabaseError, twitchDefaultChannel: TWITCH_DEFAULT_CHANNEL || null });
-});
-
-const server = app.listen(PORT, () => {
-  console.log(`[chat-gateway] listening on :${PORT}`);
-});
-server.on("error", (err) => console.error("[chat-gateway] server error", err));
-
-// ============================
-// ONE WS server + path routing
-// ============================
-
-const wss = new WebSocketServer({ noServer: true });
-
-server.on("upgrade", (req, socket, head) => {
-  try {
-    const u = new URL(req.url ?? "", "http://localhost");
-    const p = u.pathname;
-
-    // only accept our ws paths
-    if (p !== "/ws" && p !== "/ws/chat") {
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket as any, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
-  } catch {
-    socket.destroy();
-  }
-});
-
-wss.on("connection", async (socket, req) => {
-  const u = new URL(req.url ?? "", "http://localhost");
-  const p = u.pathname;
-
-  // ---- /ws (debug hello/echo) ----
-  if (p === "/ws") {
-    sendJSON(socket as any, { type: "hello", ts: Date.now() });
-    (socket as any).on("message", (raw: RawData) => {
-      sendJSON(socket as any, { type: "echo", raw: raw.toString() });
-    });
-    return;
-  }
-
-  // ---- /ws/chat (twitch chat) ----
-  if (p === "/ws/chat") {
-    const profileId = String(u.searchParams.get("profileId") ?? "").trim();
-    const key = String(u.searchParams.get("key") ?? "").trim();
-
-    let channel = "";
-
-    if (profileId) {
-      const cfg = await fetchProfileConfig(profileId);
-      if (!cfg) {
-        sendJSON(socket as any, { type: "error", msg: "profile not found" });
-        (socket as any).close();
-        return;
-      }
-
-      if (!keyMatches(cfg, key)) {
-        sendJSON(socket as any, { type: "error", msg: "forbidden (bad key)" });
-        (socket as any).close();
-        return;
-      }
-
-      channel = String(cfg.twitch_channel ?? "").trim().toLowerCase();
-      if (!channel) {
-        sendJSON(socket as any, { type: "error", msg: "no twitch_channel configured for this profile" });
-        (socket as any).close();
-        return;
-      }
-
-      const conn = ensureConn(channel);
-      if (!conn) {
-        sendJSON(socket as any, { type: "error", msg: "invalid channel" });
-        (socket as any).close();
-        return;
-      }
-
-      conn.clients.add(socket as any);
-      conn.lastNonce = Number(cfg.twitch_reconnect_nonce ?? 0);
-      await ensureProfilePolling(conn, profileId);
-
-      sendJSON(socket as any, { type: "info", msg: `subscribed #${channel} (profile)` });
-
-      (socket as any).on("close", () => {
-        conn.clients.delete(socket as any);
-        stopConnIfIdle(conn);
-      });
-
-      return;
-    }
-
-    // fallback mode (default channel)
-    channel = TWITCH_DEFAULT_CHANNEL;
-    if (!channel) {
-      sendJSON(socket as any, { type: "error", msg: "no profileId/key and no TWITCH_DEFAULT_CHANNEL set" });
-      (socket as any).close();
-      return;
-    }
-
-    const conn = ensureConn(channel);
-    if (!conn) {
-      sendJSON(socket as any, { type: "error", msg: "invalid channel" });
-      (socket as any).close();
-      return;
-    }
-
-    conn.clients.add(socket as any);
-    sendJSON(socket as any, { type: "info", msg: `subscribed #${channel} (default)` });
-
-    (socket as any).on("close", () => {
-      conn.clients.delete(socket as any);
-      stopConnIfIdle(conn);
-    });
-
-    return;
-  }
-
-  // safety
-  try {
-    (socket as any).close();
-  } catch { }
-});
-
-// ============================
-// Twitch Chat WS (/ws/chat)
-// ============================
+// ---------- types ----------
+type Roleless = any;
 
 type ProfileConfig = {
   profileId: string;
@@ -171,26 +29,9 @@ type ProfileConfig = {
   obs_view_key?: string | null;
 };
 
-async function fetchProfileConfig(profileId: string): Promise<ProfileConfig | null> {
-  if (!supabase) return null;
-
-  // select * to be resilient against schema naming differences
-  const { data, error } = await supabase.from("profiles").select("*").eq("id", profileId).maybeSingle();
-  if (error || !data) return null;
-
-  return {
-    profileId,
-    twitch_channel: (data as any).twitch_channel ?? null,
-    twitch_reconnect_nonce: Number((data as any).twitch_reconnect_nonce ?? 0),
-    view_key: (data as any).view_key ?? (data as any).viewKey ?? null,
-    obs_view_key: (data as any).obs_view_key ?? (data as any).obsViewKey ?? (data as any).key ?? null,
-  };
-}
-
-function keyMatches(cfg: ProfileConfig, key: string) {
-  const k = String(key || "");
-  return !!k && (k === String(cfg.view_key ?? "") || k === String(cfg.obs_view_key ?? ""));
-}
+type ExtProvider = "bttv" | "ffz" | "7tv";
+type EmoteEntry = { url: string; provider: ExtProvider };
+type EmoteMap = Record<string, EmoteEntry>;
 
 type TwitchConn = {
   channel: string;
@@ -199,17 +40,26 @@ type TwitchConn = {
   clients: Set<WebSocket>;
   connecting: boolean;
   closed: boolean;
+
   profileId?: string;
   lastNonce?: number;
   pollTimer?: NodeJS.Timeout;
+
+  twitchId?: string; // twitch channel id (room-id)
+  assets?: EmoteMap;
+  assetsLoadedAt?: number;
+  assetsLoading?: boolean;
 };
 
-const conns = new Map<string, TwitchConn>();
+// ---------- helpers ----------
+function uid() {
+  return Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
 
 function sendJSON(ws: WebSocket, obj: any) {
   try {
     ws.send(JSON.stringify(obj));
-  } catch { }
+  } catch {}
 }
 
 function broadcast(conn: TwitchConn, obj: any) {
@@ -217,16 +67,16 @@ function broadcast(conn: TwitchConn, obj: any) {
   for (const c of conn.clients) {
     try {
       c.send(msg);
-    } catch { }
+    } catch {}
   }
 }
 
 function stopConnIfIdle(conn: TwitchConn) {
   if (conn.clients.size > 0) return;
-  // no clients -> close IRC + stop polling
+
   try {
     conn.irc?.close();
-  } catch { }
+  } catch {}
   conn.irc = null;
 
   if (conn.pollTimer) {
@@ -245,6 +95,289 @@ function parseTags(tagStr: string) {
   return out;
 }
 
+function httpsify(u: string) {
+  if (!u) return "";
+  if (u.startsWith("//")) return "https:" + u;
+  if (u.startsWith("http://")) return "https://" + u.slice("http://".length);
+  if (u.startsWith("https://")) return u;
+  return "https://" + u;
+}
+
+async function httpJson(url: string) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok) throw new Error(`fetch failed ${res.status} ${url}`);
+  return res.json();
+}
+
+async function fetchProfileConfig(profileId: string): Promise<ProfileConfig | null> {
+  if (!supabase) return null;
+
+  const { data, error } = await supabase.from("profiles").select("*").eq("id", profileId).maybeSingle();
+  if (error || !data) return null;
+
+  return {
+    profileId,
+    twitch_channel: (data as any).twitch_channel ?? null,
+    twitch_reconnect_nonce: Number((data as any).twitch_reconnect_nonce ?? 0),
+    view_key: (data as any).view_key ?? (data as any).viewKey ?? null,
+    obs_view_key: (data as any).obs_view_key ?? (data as any).obsViewKey ?? (data as any).key ?? null,
+  };
+}
+
+function keyMatches(cfg: ProfileConfig, key: string) {
+  const k = String(key || "");
+  return !!k && (k === String(cfg.view_key ?? "") || k === String(cfg.obs_view_key ?? ""));
+}
+
+// ---------- assets cache ----------
+const globalAssets: { loadedAt: number; map: EmoteMap } = { loadedAt: 0, map: {} };
+const channelAssets = new Map<string, { loadedAt: number; map: EmoteMap; twitchId?: string }>();
+
+function mergeEmotes(into: EmoteMap, from: EmoteMap) {
+  for (const [code, v] of Object.entries(from)) {
+    // channel emotes sollen global überschreiben -> wir lassen "from" gewinnen
+    into[code] = v;
+  }
+}
+
+async function loadBTTVGlobal(): Promise<EmoteMap> {
+  // https://api.betterttv.net/3/cached/emotes/global :contentReference[oaicite:3]{index=3}
+  const arr: any[] = await httpJson("https://api.betterttv.net/3/cached/emotes/global");
+  const out: EmoteMap = {};
+  for (const e of arr || []) {
+    const code = String(e?.code ?? "").trim();
+    const id = String(e?.id ?? "").trim();
+    if (!code || !id) continue;
+    out[code] = { provider: "bttv", url: `https://cdn.betterttv.net/emote/${id}/2x` };
+  }
+  return out;
+}
+
+async function loadBTTVChannel(twitchId: string): Promise<EmoteMap> {
+  // https://api.betterttv.net/3/cached/users/twitch/<id> :contentReference[oaicite:4]{index=4}
+  const j: any = await httpJson(`https://api.betterttv.net/3/cached/users/twitch/${encodeURIComponent(twitchId)}`);
+  const out: EmoteMap = {};
+
+  const push = (e: any) => {
+    const code = String(e?.code ?? "").trim();
+    const id = String(e?.id ?? "").trim();
+    if (!code || !id) return;
+    out[code] = { provider: "bttv", url: `https://cdn.betterttv.net/emote/${id}/2x` };
+  };
+
+  for (const e of (j?.channelEmotes ?? [])) push(e);
+  for (const e of (j?.sharedEmotes ?? [])) push(e);
+  return out;
+}
+
+async function loadFFZGlobal(): Promise<EmoteMap> {
+  // https://api.frankerfacez.com/v1/set/global :contentReference[oaicite:5]{index=5}
+  const j: any = await httpJson("https://api.frankerfacez.com/v1/set/global");
+  const out: EmoteMap = {};
+
+  const sets = j?.sets ?? {};
+  const defaultSets: any[] = j?.default_sets ?? [];
+
+  for (const setId of defaultSets) {
+    const set = sets?.[String(setId)];
+    const emoticons = set?.emoticons ?? [];
+    for (const em of emoticons) {
+      const code = String(em?.name ?? "").trim();
+      const urls = em?.urls ?? {};
+      const url = httpsify(String(urls["2"] ?? urls["1"] ?? urls["4"] ?? ""));
+      if (!code || !url) continue;
+      out[code] = { provider: "ffz", url };
+    }
+  }
+
+  return out;
+}
+
+async function loadFFZRoom(channel: string): Promise<{ twitchId?: string; map: EmoteMap }> {
+  // https://api.frankerfacez.com/v1/room/<name> :contentReference[oaicite:6]{index=6}
+  const j: any = await httpJson(`https://api.frankerfacez.com/v1/room/${encodeURIComponent(channel)}`);
+  const room = j?.room;
+  const twitchId = room?.twitch_id ? String(room.twitch_id) : undefined;
+  const setId = room?.set ? String(room.set) : "";
+  const set = j?.sets?.[setId];
+
+  const out: EmoteMap = {};
+  const emoticons = set?.emoticons ?? [];
+  for (const em of emoticons) {
+    const code = String(em?.name ?? "").trim();
+    const urls = em?.urls ?? {};
+    const url = httpsify(String(urls["2"] ?? urls["1"] ?? urls["4"] ?? ""));
+    if (!code || !url) continue;
+    out[code] = { provider: "ffz", url };
+  }
+
+  return { twitchId, map: out };
+}
+
+function parse7tvSetToMap(j: any): EmoteMap {
+  // expects v3 emote set shape: { emotes: [ { name, data: { host: { url, files:[{name,format,...}] } } } ] }
+  const out: EmoteMap = {};
+  const emotes = Array.isArray(j?.emotes) ? j.emotes : [];
+
+  for (const e of emotes) {
+    const code = String(e?.name ?? "").trim();
+    const host = e?.data?.host ?? e?.data?.host ?? e?.host;
+    const hostUrlRaw = String(host?.url ?? "");
+    const hostUrl = httpsify(hostUrlRaw);
+
+    const files: any[] = Array.isArray(host?.files) ? host.files : [];
+    if (!code || !hostUrl || files.length === 0) continue;
+
+    // pick best file: prefer webp, prefer "2x"
+    const byFormat = (fmt: string) => files.filter((f) => String(f?.format ?? "").toLowerCase() === fmt);
+
+    const pickFrom = (arr: any[]) =>
+      arr.find((f) => String(f?.name ?? "").includes("2x")) ||
+      arr.find((f) => String(f?.name ?? "").includes("3x")) ||
+      arr[0];
+
+    const f =
+      pickFrom(byFormat("webp")) ||
+      pickFrom(byFormat("avif")) ||
+      pickFrom(byFormat("gif")) ||
+      pickFrom(files);
+
+    const fileName = String(f?.name ?? "");
+    if (!fileName) continue;
+
+    out[code] = { provider: "7tv", url: `${hostUrl}/${fileName}` };
+  }
+
+  return out;
+}
+
+async function load7TVGlobal(): Promise<EmoteMap> {
+  // https://7tv.io/v3/emote-sets/global :contentReference[oaicite:7]{index=7}
+  const j: any = await httpJson("https://7tv.io/v3/emote-sets/global");
+  return parse7tvSetToMap(j);
+}
+
+async function load7TVChannel(twitchId: string): Promise<EmoteMap> {
+  // https://7tv.io/v3/users/twitch/<id> :contentReference[oaicite:8]{index=8}
+  const user: any = await httpJson(`https://7tv.io/v3/users/twitch/${encodeURIComponent(twitchId)}`);
+  const setId =
+    user?.emote_set?.id ||
+    user?.emote_set_id ||
+    user?.emoteSet?.id ||
+    user?.emoteSetId;
+
+  if (!setId) return {};
+
+  const set: any = await httpJson(`https://7tv.io/v3/emote-sets/${encodeURIComponent(String(setId))}`);
+  return parse7tvSetToMap(set);
+}
+
+async function ensureGlobalAssetsFresh(): Promise<EmoteMap> {
+  const now = Date.now();
+  if (globalAssets.loadedAt && now - globalAssets.loadedAt < ASSET_TTL_MS) return globalAssets.map;
+
+  try {
+    const [bttvG, ffzG, stvG] = await Promise.all([
+      loadBTTVGlobal().catch(() => ({} as EmoteMap)),
+      loadFFZGlobal().catch(() => ({} as EmoteMap)),
+      load7TVGlobal().catch(() => ({} as EmoteMap)),
+    ]);
+
+    const combined: EmoteMap = {};
+    mergeEmotes(combined, ffzG);
+    mergeEmotes(combined, bttvG);
+    mergeEmotes(combined, stvG);
+
+    globalAssets.map = combined;
+    globalAssets.loadedAt = now;
+    return combined;
+  } catch {
+    // keep old cache on failure
+    return globalAssets.map;
+  }
+}
+
+async function ensureAssetsForChannel(channel: string, twitchId?: string): Promise<EmoteMap> {
+  const now = Date.now();
+  const cached = channelAssets.get(channel);
+  if (cached && cached.loadedAt && now - cached.loadedAt < ASSET_TTL_MS) return cached.map;
+
+  const globals = await ensureGlobalAssetsFresh();
+
+  // get twitch id via FFZ room if not provided
+  let tid = twitchId;
+  let ffzRoom: { twitchId?: string; map: EmoteMap } = { map: {} };
+
+  try {
+    ffzRoom = await loadFFZRoom(channel);
+    if (!tid) tid = ffzRoom.twitchId;
+  } catch {}
+
+  const [bttvC, stvC] = await Promise.all([
+    tid ? loadBTTVChannel(tid).catch(() => ({} as EmoteMap)) : Promise.resolve({} as EmoteMap),
+    tid ? load7TVChannel(tid).catch(() => ({} as EmoteMap)) : Promise.resolve({} as EmoteMap),
+  ]);
+
+  const combined: EmoteMap = {};
+  mergeEmotes(combined, globals);
+
+  // channel-specific wins
+  mergeEmotes(combined, ffzRoom.map);
+  mergeEmotes(combined, bttvC);
+  mergeEmotes(combined, stvC);
+
+  channelAssets.set(channel, { loadedAt: now, map: combined, twitchId: tid });
+  return combined;
+}
+
+async function pushAssetsToClient(conn: TwitchConn, ws: WebSocket) {
+  // load only once per connection/ttl
+  const now = Date.now();
+  if (conn.assets && conn.assetsLoadedAt && now - conn.assetsLoadedAt < ASSET_TTL_MS) {
+    sendJSON(ws, { type: "assets", emotes: conn.assets, ts: Date.now() });
+    return;
+  }
+
+  if (conn.assetsLoading) return;
+  conn.assetsLoading = true;
+
+  try {
+    const map = await ensureAssetsForChannel(conn.channel, conn.twitchId);
+    conn.assets = map;
+    conn.assetsLoadedAt = Date.now();
+    sendJSON(ws, { type: "assets", emotes: map, ts: Date.now() });
+  } finally {
+    conn.assetsLoading = false;
+  }
+}
+
+async function broadcastAssets(conn: TwitchConn) {
+  const now = Date.now();
+  if (conn.assets && conn.assetsLoadedAt && now - conn.assetsLoadedAt < ASSET_TTL_MS) {
+    broadcast(conn, { type: "assets", emotes: conn.assets, ts: Date.now() });
+    return;
+  }
+  if (conn.assetsLoading) return;
+
+  conn.assetsLoading = true;
+  try {
+    const map = await ensureAssetsForChannel(conn.channel, conn.twitchId);
+    conn.assets = map;
+    conn.assetsLoadedAt = Date.now();
+    broadcast(conn, { type: "assets", emotes: map, ts: Date.now() });
+  } finally {
+    conn.assetsLoading = false;
+  }
+}
+
+// ---------- twitch IRC ----------
+const conns = new Map<string, TwitchConn>();
+
 function connectTwitch(conn: TwitchConn) {
   if (conn.connecting || conn.closed) return;
   conn.connecting = true;
@@ -257,7 +390,6 @@ function connectTwitch(conn: TwitchConn) {
   const nick = `justinfan${Math.floor(10000 + Math.random() * 89999)}`;
 
   irc.onopen = () => {
-    // tags/commands/membership gives display-name, color, etc.
     irc.send("CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership");
     irc.send("PASS SCHMOOPIIE");
     irc.send(`NICK ${nick}`);
@@ -265,6 +397,9 @@ function connectTwitch(conn: TwitchConn) {
     conn.connecting = false;
 
     broadcast(conn, { type: "info", msg: `connected to #${conn.channel}` });
+
+    // preload assets (best effort)
+    void broadcastAssets(conn);
   };
 
   irc.onmessage = (ev: any) => {
@@ -278,16 +413,13 @@ function connectTwitch(conn: TwitchConn) {
       if (!line) continue;
 
       if (line.startsWith("PING ")) {
-        // PING :tmi.twitch.tv
         const payload = line.slice(5);
         try {
           irc.send("PONG " + payload);
-        } catch { }
+        } catch {}
         continue;
       }
 
-      // We want PRIVMSG
-      // Format: @tags :prefix PRIVMSG #channel :message
       let tags: Record<string, string> = {};
       let rest = line;
 
@@ -298,7 +430,6 @@ function connectTwitch(conn: TwitchConn) {
         rest = rest.slice(sp + 1);
       }
 
-      // prefix
       let prefix = "";
       if (rest.startsWith(":")) {
         const sp = rest.indexOf(" ");
@@ -306,9 +437,15 @@ function connectTwitch(conn: TwitchConn) {
         rest = rest.slice(sp + 1);
       }
 
+      // update twitch id if present
+      const roomId = tags["room-id"];
+      if (roomId && !conn.twitchId) {
+        conn.twitchId = String(roomId);
+        void broadcastAssets(conn);
+      }
+
       if (!rest.includes("PRIVMSG")) continue;
 
-      // Example: PRIVMSG #channel :hello
       const msgIdx = rest.indexOf(" :");
       if (msgIdx < 0) continue;
 
@@ -330,10 +467,7 @@ function connectTwitch(conn: TwitchConn) {
         color,
         ts: Date.now(),
 
-        // ✅ wichtig für Twitch-Emotes (Positions im Text)
         emotes: tags["emotes"] || "",
-
-        // (optional für später: badges)
         badges: tags["badges"] || "",
         badge_info: tags["badge-info"] || "",
         user_id: tags["user-id"] || "",
@@ -351,7 +485,6 @@ function connectTwitch(conn: TwitchConn) {
     conn.irc = null;
     conn.connecting = false;
 
-    // retry if still has clients
     if (!conn.closed && conn.clients.size > 0) {
       setTimeout(() => connectTwitch(conn), 1500);
     }
@@ -375,17 +508,13 @@ function ensureConn(channel: string) {
     conns.set(ch, conn);
   }
 
-  if (!conn.irc && !conn.connecting) {
-    connectTwitch(conn);
-  }
-
+  if (!conn.irc && !conn.connecting) connectTwitch(conn);
   return conn;
 }
 
 async function ensureProfilePolling(conn: TwitchConn, profileId: string) {
   if (!supabase) return;
   conn.profileId = profileId;
-
   if (conn.pollTimer) return;
 
   conn.pollTimer = setInterval(async () => {
@@ -402,17 +531,15 @@ async function ensureProfilePolling(conn: TwitchConn, profileId: string) {
     if (nextCh && nextCh !== conn.channel) {
       broadcast(conn, { type: "info", msg: `channel changed -> #${nextCh}` });
 
-      // move clients to new connection
       const newConn = ensureConn(nextCh);
       if (!newConn) return;
 
-      // transfer clients
       for (const c of conn.clients) {
         newConn.clients.add(c);
         sendJSON(c, { type: "info", msg: `switched to #${nextCh}` });
+        void pushAssetsToClient(newConn, c);
       }
       conn.clients.clear();
-
       stopConnIfIdle(conn);
       return;
     }
@@ -421,11 +548,154 @@ async function ensureProfilePolling(conn: TwitchConn, profileId: string) {
     if (conn.lastNonce === undefined) conn.lastNonce = nextNonce;
     if (nextNonce !== conn.lastNonce) {
       conn.lastNonce = nextNonce;
-      broadcast(conn, { type: "info", msg: "reconnect triggered" });
+
+      // invalidate assets so next push reloads
+      conn.assetsLoadedAt = 0;
+      void broadcastAssets(conn);
+
       try {
         conn.irc?.close();
-      } catch { }
+      } catch {}
     }
   }, POLL_MS);
 }
 
+// ---------- HTTP server ----------
+const app = express();
+
+app.get("/health", async (_req, res) => {
+  let supabaseOk = false;
+  let supabaseError: string | null = null;
+
+  if (supabase) {
+    const { error } = await supabase.from("profiles").select("id").limit(1);
+    supabaseOk = !error;
+    supabaseError = error ? (error.message || JSON.stringify(error)) : null;
+  }
+
+  res.json({
+    ok: true,
+    hasSupabase,
+    supabaseOk,
+    supabaseError,
+    twitchDefaultChannel: TWITCH_DEFAULT_CHANNEL || null,
+    assetTTLms: ASSET_TTL_MS,
+  });
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`[chat-gateway] listening on :${PORT}`);
+});
+server.on("error", (err) => console.error("[chat-gateway] server error", err));
+
+// ---------- ONE WS server + path routing ----------
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const u = new URL(req.url ?? "", "http://localhost");
+    const p = u.pathname;
+    if (p !== "/ws" && p !== "/ws/chat") {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket as any, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
+wss.on("connection", async (socket, req) => {
+  const u = new URL(req.url ?? "", "http://localhost");
+  const p = u.pathname;
+
+  // ---- /ws (debug) ----
+  if (p === "/ws") {
+    sendJSON(socket as any, { type: "hello", ts: Date.now() });
+    (socket as any).on("message", (raw: RawData) => {
+      sendJSON(socket as any, { type: "echo", raw: raw.toString() });
+    });
+    return;
+  }
+
+  // ---- /ws/chat ----
+  if (p === "/ws/chat") {
+    const profileId = String(u.searchParams.get("profileId") ?? "").trim();
+    const key = String(u.searchParams.get("key") ?? "").trim();
+
+    // profile mode
+    if (profileId) {
+      const cfg = await fetchProfileConfig(profileId);
+      if (!cfg) {
+        sendJSON(socket as any, { type: "error", msg: "profile not found" });
+        (socket as any).close();
+        return;
+      }
+      if (!keyMatches(cfg, key)) {
+        sendJSON(socket as any, { type: "error", msg: "forbidden (bad key)" });
+        (socket as any).close();
+        return;
+      }
+
+      const channel = String(cfg.twitch_channel ?? "").trim().toLowerCase();
+      if (!channel) {
+        sendJSON(socket as any, { type: "error", msg: "no twitch_channel configured for this profile" });
+        (socket as any).close();
+        return;
+      }
+
+      const conn = ensureConn(channel);
+      if (!conn) {
+        sendJSON(socket as any, { type: "error", msg: "invalid channel" });
+        (socket as any).close();
+        return;
+      }
+
+      conn.clients.add(socket as any);
+      conn.lastNonce = Number(cfg.twitch_reconnect_nonce ?? 0);
+      await ensureProfilePolling(conn, profileId);
+
+      // send assets to this client
+      await pushAssetsToClient(conn, socket as any);
+
+      (socket as any).on("close", () => {
+        conn.clients.delete(socket as any);
+        stopConnIfIdle(conn);
+      });
+
+      return;
+    }
+
+    // default mode (editor preview)
+    const channel = TWITCH_DEFAULT_CHANNEL;
+    if (!channel) {
+      sendJSON(socket as any, { type: "error", msg: "no profileId/key and no TWITCH_DEFAULT_CHANNEL set" });
+      (socket as any).close();
+      return;
+    }
+
+    const conn = ensureConn(channel);
+    if (!conn) {
+      sendJSON(socket as any, { type: "error", msg: "invalid channel" });
+      (socket as any).close();
+      return;
+    }
+
+    conn.clients.add(socket as any);
+    await pushAssetsToClient(conn, socket as any);
+
+    (socket as any).on("close", () => {
+      conn.clients.delete(socket as any);
+      stopConnIfIdle(conn);
+    });
+
+    return;
+  }
+
+  try {
+    (socket as any).close();
+  } catch {}
+});
