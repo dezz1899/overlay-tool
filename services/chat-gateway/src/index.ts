@@ -5,6 +5,7 @@ import type { RawData } from "ws";
 import { createClient } from "@supabase/supabase-js";
 
 console.log("[chat-gateway] ASSETS BUILD ACTIVE");
+const BUILD_ID = "badges-fix-2026-03-04-01";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
@@ -682,6 +683,7 @@ app.get("/health", async (_req, res) => {
     badgeGlobalCount: lastBadgeGlobalCount,
     badgeChannelCount: lastBadgeChannelCount,
     badgeLastError: lastBadgeError,
+    buildId: BUILD_ID,
   });
 });
 
