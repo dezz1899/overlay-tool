@@ -19,6 +19,9 @@ const TWITCH_DEFAULT_CHANNEL = String(process.env.TWITCH_DEFAULT_CHANNEL ?? "").
 const POLL_MS = Math.max(3000, Number(process.env.TWITCH_POLL_MS ?? 8000)); // reconnect/channel change polling
 const ASSET_TTL_MS = Math.max(60_000, Number(process.env.ASSET_TTL_MS ?? 10 * 60 * 1000)); // 10min default
 const UA = "overlay-tool-chat-gateway/1.0";
+let lastBadgeError: string | null = null;
+let lastBadgeGlobalCount = 0;
+let lastBadgeChannelCount = 0;
 
 // ---------- types ----------
 type Roleless = any;
@@ -132,13 +135,25 @@ function parseBadgeSetsToMap(j: any): BadgeMap {
 }
 
 async function loadGlobalBadges(): Promise<BadgeMap> {
-  const j: any = await httpJson("https://badges.twitch.tv/v1/badges/global/display?language=en");
-  return parseBadgeSetsToMap(j);
+  const url = "https://badges.twitch.tv/v1/badges/global/display?language=en";
+  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`global badges fetch failed ${res.status}: ${txt.slice(0, 160)}`);
+  const j = JSON.parse(txt);
+  const map = parseBadgeSetsToMap(j);
+  if (Object.keys(map).length === 0) throw new Error(`global badges parsed 0 keys; topKeys=${Object.keys(j || {}).join(",")}`);
+  return map;
 }
 
 async function loadChannelBadges(roomId: string): Promise<BadgeMap> {
-  const j: any = await httpJson(`https://badges.twitch.tv/v1/badges/channels/${encodeURIComponent(roomId)}/display?language=en`);
-  return parseBadgeSetsToMap(j);
+  const url = `https://badges.twitch.tv/v1/badges/channels/${encodeURIComponent(roomId)}/display?language=en`;
+  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`channel badges fetch failed ${res.status}: ${txt.slice(0, 160)}`);
+  const j = JSON.parse(txt);
+  const map = parseBadgeSetsToMap(j);
+  // channel badges können bei neuen/kleinen channels leer sein, aber meistens nicht
+  return map;
 }
 
 async function ensureBadgesForChannel(channel: string, roomId?: string): Promise<BadgeMap> {
@@ -149,8 +164,10 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
     try {
       globalBadges.map = await loadGlobalBadges();
       globalBadges.loadedAt = now;
-    } catch {
-      // keep old cache
+      lastBadgeGlobalCount = Object.keys(globalBadges.map).length;
+      lastBadgeError = null;
+    } catch (e: any) {
+      lastBadgeError = String(e?.message ?? e);
     }
   }
 
@@ -164,6 +181,7 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
       try {
         chMap = await loadChannelBadges(roomId);
         channelBadges.set(channel, { loadedAt: now, map: chMap, roomId });
+        lastBadgeChannelCount = Object.keys(chMap).length;
       } catch {
         if (cached?.map) chMap = cached.map;
       }
@@ -646,6 +664,9 @@ app.get("/health", async (_req, res) => {
     supabaseError,
     twitchDefaultChannel: TWITCH_DEFAULT_CHANNEL || null,
     assetTTLms: ASSET_TTL_MS,
+    badgeGlobalCount: lastBadgeGlobalCount,
+    badgeChannelCount: lastBadgeChannelCount,
+    badgeLastError: lastBadgeError,
   });
 });
 
