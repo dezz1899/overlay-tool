@@ -159,8 +159,16 @@ async function loadChannelBadges(roomId: string): Promise<BadgeMap> {
 async function ensureBadgesForChannel(channel: string, roomId?: string): Promise<BadgeMap> {
   const now = Date.now();
 
-  // global cache refresh
-  if (!globalBadges.loadedAt || now - globalBadges.loadedAt >= ASSET_TTL_MS) {
+  // global cache refresh (✅ treat empty map as stale)
+  const globalKeyCount = Object.keys(globalBadges.map || {}).length;
+  lastBadgeGlobalCount = globalKeyCount;
+
+  const needGlobalReload =
+    !globalBadges.loadedAt ||
+    now - globalBadges.loadedAt >= ASSET_TTL_MS ||
+    globalKeyCount === 0;
+
+  if (needGlobalReload) {
     try {
       globalBadges.map = await loadGlobalBadges();
       globalBadges.loadedAt = now;
@@ -168,6 +176,7 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
       lastBadgeError = null;
     } catch (e: any) {
       lastBadgeError = String(e?.message ?? e);
+      globalBadges.loadedAt = 0; // ✅ force retry next time
     }
   }
 
