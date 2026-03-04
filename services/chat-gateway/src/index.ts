@@ -186,13 +186,17 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
     const cached = channelBadges.get(channel);
     if (cached?.loadedAt && now - cached.loadedAt < ASSET_TTL_MS && cached.roomId === roomId) {
       chMap = cached.map;
+      lastBadgeChannelCount = Object.keys(chMap).length;
     } else {
       try {
         chMap = await loadChannelBadges(roomId);
         channelBadges.set(channel, { loadedAt: now, map: chMap, roomId });
         lastBadgeChannelCount = Object.keys(chMap).length;
       } catch {
-        if (cached?.map) chMap = cached.map;
+        if (cached?.map) {
+          chMap = cached.map;
+          lastBadgeChannelCount = Object.keys(chMap).length;
+        }
       }
     }
   }
@@ -429,7 +433,8 @@ async function pushAssetsToClient(conn: TwitchConn, ws: WebSocket) {
   // load only once per connection/ttl
   const now = Date.now();
   if (conn.assets && conn.assetsLoadedAt && now - conn.assetsLoadedAt < ASSET_TTL_MS) {
-    sendJSON(ws, { type: "assets", emotes: conn.assets, ts: Date.now() });
+    const badges = await ensureBadgesForChannel(conn.channel, conn.twitchId);
+    sendJSON(ws, { type: "assets", emotes: conn.assets, badges, ts: Date.now() });
     return;
   }
 
@@ -451,7 +456,8 @@ async function pushAssetsToClient(conn: TwitchConn, ws: WebSocket) {
 async function broadcastAssets(conn: TwitchConn) {
   const now = Date.now();
   if (conn.assets && conn.assetsLoadedAt && now - conn.assetsLoadedAt < ASSET_TTL_MS) {
-    broadcast(conn, { type: "assets", emotes: conn.assets, ts: Date.now() });
+    const badges = await ensureBadgesForChannel(conn.channel, conn.twitchId);
+    broadcast(conn, { type: "assets", emotes: conn.assets, badges, ts: Date.now() });
     return;
   }
   if (conn.assetsLoading) return;
