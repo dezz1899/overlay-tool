@@ -118,7 +118,6 @@ async function httpJson(url: string) {
 }
 
 function parseBadgeSetsToMap(j: any): BadgeMap {
-  // badges.twitch.tv returns { badge_sets: { set: { versions: { "1": { image_url_2x ... } } } } }
   const out: BadgeMap = {};
   const sets = j?.badge_sets ?? {};
   for (const [setName, setObj] of Object.entries<any>(sets)) {
@@ -145,20 +144,20 @@ async function loadChannelBadges(roomId: string): Promise<BadgeMap> {
 async function ensureBadgesForChannel(channel: string, roomId?: string): Promise<BadgeMap> {
   const now = Date.now();
 
-  // global cache
+  // global cache refresh
   if (!globalBadges.loadedAt || now - globalBadges.loadedAt >= ASSET_TTL_MS) {
     try {
       globalBadges.map = await loadGlobalBadges();
       globalBadges.loadedAt = now;
     } catch {
-      // keep old cache on failure
+      // keep old cache
     }
   }
 
-  // channel cache (optional, needs roomId)
+  // channel cache refresh (only if we have roomId)
   let chMap: BadgeMap = {};
-  const cached = channelBadges.get(channel);
   if (roomId) {
+    const cached = channelBadges.get(channel);
     if (cached?.loadedAt && now - cached.loadedAt < ASSET_TTL_MS && cached.roomId === roomId) {
       chMap = cached.map;
     } else {
@@ -166,15 +165,15 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
         chMap = await loadChannelBadges(roomId);
         channelBadges.set(channel, { loadedAt: now, map: chMap, roomId });
       } catch {
-        // keep old if present
         if (cached?.map) chMap = cached.map;
       }
     }
   }
 
-  // merge: channel overrides global
+  // channel overrides global
   return { ...globalBadges.map, ...chMap };
 }
+
 
 async function fetchProfileConfig(profileId: string): Promise<ProfileConfig | null> {
   if (!supabase) return null;
@@ -420,6 +419,7 @@ async function pushAssetsToClient(conn: TwitchConn, ws: WebSocket) {
     conn.assetsLoading = false;
   }
 }
+
 
 async function broadcastAssets(conn: TwitchConn) {
   const now = Date.now();
