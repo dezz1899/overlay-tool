@@ -34,6 +34,7 @@ type ProfileConfig = {
 type ExtProvider = "bttv" | "ffz" | "7tv";
 type EmoteEntry = { url: string; provider: ExtProvider };
 type EmoteMap = Record<string, EmoteEntry>;
+type BadgeMap = Record<string, string>; // "set/version" -> image_url_2x
 
 type TwitchConn = {
   channel: string;
@@ -61,7 +62,7 @@ function uid() {
 function sendJSON(ws: WebSocket, obj: any) {
   try {
     ws.send(JSON.stringify(obj));
-  } catch {}
+  } catch { }
 }
 
 function broadcast(conn: TwitchConn, obj: any) {
@@ -69,7 +70,7 @@ function broadcast(conn: TwitchConn, obj: any) {
   for (const c of conn.clients) {
     try {
       c.send(msg);
-    } catch {}
+    } catch { }
   }
 }
 
@@ -78,7 +79,7 @@ function stopConnIfIdle(conn: TwitchConn) {
 
   try {
     conn.irc?.close();
-  } catch {}
+  } catch { }
   conn.irc = null;
 
   if (conn.pollTimer) {
@@ -116,6 +117,65 @@ async function httpJson(url: string) {
   return res.json();
 }
 
+function parseBadgeSetsToMap(j: any): BadgeMap {
+  // badges.twitch.tv returns { badge_sets: { set: { versions: { "1": { image_url_2x ... } } } } }
+  const out: BadgeMap = {};
+  const sets = j?.badge_sets ?? {};
+  for (const [setName, setObj] of Object.entries<any>(sets)) {
+    const versions = setObj?.versions ?? {};
+    for (const [ver, vObj] of Object.entries<any>(versions)) {
+      const url = String(vObj?.image_url_2x ?? vObj?.image_url_1x ?? "");
+      if (!url) continue;
+      out[`${setName}/${ver}`] = url;
+    }
+  }
+  return out;
+}
+
+async function loadGlobalBadges(): Promise<BadgeMap> {
+  const j: any = await httpJson("https://badges.twitch.tv/v1/badges/global/display?language=en");
+  return parseBadgeSetsToMap(j);
+}
+
+async function loadChannelBadges(roomId: string): Promise<BadgeMap> {
+  const j: any = await httpJson(`https://badges.twitch.tv/v1/badges/channels/${encodeURIComponent(roomId)}/display?language=en`);
+  return parseBadgeSetsToMap(j);
+}
+
+async function ensureBadgesForChannel(channel: string, roomId?: string): Promise<BadgeMap> {
+  const now = Date.now();
+
+  // global cache
+  if (!globalBadges.loadedAt || now - globalBadges.loadedAt >= ASSET_TTL_MS) {
+    try {
+      globalBadges.map = await loadGlobalBadges();
+      globalBadges.loadedAt = now;
+    } catch {
+      // keep old cache on failure
+    }
+  }
+
+  // channel cache (optional, needs roomId)
+  let chMap: BadgeMap = {};
+  const cached = channelBadges.get(channel);
+  if (roomId) {
+    if (cached?.loadedAt && now - cached.loadedAt < ASSET_TTL_MS && cached.roomId === roomId) {
+      chMap = cached.map;
+    } else {
+      try {
+        chMap = await loadChannelBadges(roomId);
+        channelBadges.set(channel, { loadedAt: now, map: chMap, roomId });
+      } catch {
+        // keep old if present
+        if (cached?.map) chMap = cached.map;
+      }
+    }
+  }
+
+  // merge: channel overrides global
+  return { ...globalBadges.map, ...chMap };
+}
+
 async function fetchProfileConfig(profileId: string): Promise<ProfileConfig | null> {
   if (!supabase) return null;
 
@@ -139,6 +199,8 @@ function keyMatches(cfg: ProfileConfig, key: string) {
 // ---------- assets cache ----------
 const globalAssets: { loadedAt: number; map: EmoteMap } = { loadedAt: 0, map: {} };
 const channelAssets = new Map<string, { loadedAt: number; map: EmoteMap; twitchId?: string }>();
+const globalBadges: { loadedAt: number; map: BadgeMap } = { loadedAt: 0, map: {} };
+const channelBadges = new Map<string, { loadedAt: number; map: BadgeMap; roomId?: string }>();
 
 function mergeEmotes(into: EmoteMap, from: EmoteMap) {
   for (const [code, v] of Object.entries(from)) {
@@ -318,7 +380,7 @@ async function ensureAssetsForChannel(channel: string, twitchId?: string): Promi
   try {
     ffzRoom = await loadFFZRoom(channel);
     if (!tid) tid = ffzRoom.twitchId;
-  } catch {}
+  } catch { }
 
   const [bttvC, stvC] = await Promise.all([
     tid ? loadBTTVChannel(tid).catch(() => ({} as EmoteMap)) : Promise.resolve({} as EmoteMap),
@@ -352,7 +414,8 @@ async function pushAssetsToClient(conn: TwitchConn, ws: WebSocket) {
     const map = await ensureAssetsForChannel(conn.channel, conn.twitchId);
     conn.assets = map;
     conn.assetsLoadedAt = Date.now();
-    sendJSON(ws, { type: "assets", emotes: map, ts: Date.now() });
+    const badges = await ensureBadgesForChannel(conn.channel, conn.twitchId);
+    sendJSON(ws, { type: "assets", emotes: map, badges, ts: Date.now() });
   } finally {
     conn.assetsLoading = false;
   }
@@ -371,7 +434,8 @@ async function broadcastAssets(conn: TwitchConn) {
     const map = await ensureAssetsForChannel(conn.channel, conn.twitchId);
     conn.assets = map;
     conn.assetsLoadedAt = Date.now();
-    broadcast(conn, { type: "assets", emotes: map, ts: Date.now() });
+    const badges = await ensureBadgesForChannel(conn.channel, conn.twitchId);
+    broadcast(conn, { type: "assets", emotes: map, badges, ts: Date.now() });
   } finally {
     conn.assetsLoading = false;
   }
@@ -418,7 +482,7 @@ function connectTwitch(conn: TwitchConn) {
         const payload = line.slice(5);
         try {
           irc.send("PONG " + payload);
-        } catch {}
+        } catch { }
         continue;
       }
 
@@ -557,7 +621,7 @@ async function ensureProfilePolling(conn: TwitchConn, profileId: string) {
 
       try {
         conn.irc?.close();
-      } catch {}
+      } catch { }
     }
   }, POLL_MS);
 }
@@ -699,5 +763,5 @@ wss.on("connection", async (socket, req) => {
 
   try {
     (socket as any).close();
-  } catch {}
+  } catch { }
 });
