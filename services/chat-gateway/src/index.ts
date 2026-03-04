@@ -4,6 +4,8 @@ import WebSocket, { WebSocketServer } from "ws";
 import type { RawData } from "ws";
 import { createClient } from "@supabase/supabase-js";
 
+console.log("[chat-gateway] ASSETS BUILD ACTIVE");
+
 const PORT = Number(process.env.PORT ?? 8080);
 
 // ===== Supabase (server-only) =====
