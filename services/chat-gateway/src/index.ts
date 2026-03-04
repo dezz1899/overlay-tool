@@ -667,6 +667,20 @@ app.get("/health", async (_req, res) => {
   let supabaseOk = false;
   let supabaseError: string | null = null;
 
+  // --- badge probe (only when ?probe=1) ---
+  const doProbe = String((_req as any).query?.probe ?? "") === "1";
+  let badgeProbeCount: number | null = null;
+  let badgeProbeError: string | null = null;
+
+  if (doProbe) {
+    try {
+      const m = await loadGlobalBadges();
+      badgeProbeCount = Object.keys(m).length;
+    } catch (e: any) {
+      badgeProbeError = String(e?.message ?? e);
+    }
+  }
+
   if (supabase) {
     const { error } = await supabase.from("profiles").select("id").limit(1);
     supabaseOk = !error;
@@ -683,6 +697,8 @@ app.get("/health", async (_req, res) => {
     badgeGlobalCount: lastBadgeGlobalCount,
     badgeChannelCount: lastBadgeChannelCount,
     badgeLastError: lastBadgeError,
+    badgeProbeCount,
+    badgeProbeError,
     buildId: BUILD_ID,
   });
 });
