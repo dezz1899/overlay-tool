@@ -718,6 +718,27 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
       }),
     );
   }
+  if (isDebug7tvUser(twitchUserId)) {
+    console.log(
+      "[7TV][CONNECTIONS]",
+      JSON.stringify({
+        userId: twitchUserId,
+        topLevelId: j?.id ?? null,
+        userId7tv: j?.user?.id ?? null,
+        connections: Array.isArray(j?.user?.connections)
+          ? j.user.connections.map((c: any) => ({
+            keys: Object.keys(c ?? {}).slice(0, 20),
+            id: c?.id ?? null,
+            platform: c?.platform ?? null,
+            platformId: c?.platform_id ?? c?.platformId ?? null,
+            username: c?.username ?? c?.display_name ?? null,
+            linkedId: c?.linked_id ?? c?.linkedId ?? null,
+            connectionId: c?.connection_id ?? null,
+          }))
+          : [],
+      }),
+    );
+  }
 
   let paint: PaintPayload = null;
   for (const candidate of collectPaintCandidates(j)) {
