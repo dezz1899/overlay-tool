@@ -45,6 +45,27 @@ type EmoteEntry = { url: string; provider: ExtProvider };
 type EmoteMap = Record<string, EmoteEntry>;
 type BadgeMap = Record<string, string>; // "set/version" -> image_url_2x
 
+type PaintPayload =
+  | null
+  | {
+    kind: "linear";
+    angle: number;
+    stops: { at: number; color: string }[];
+    shadow?: string;
+  };
+
+type SevenTVBadge = {
+  id?: string;
+  name?: string;
+  url: string;     // final image URL
+  tooltip?: string;
+};
+
+type CosmeticsPayload = {
+  paint: PaintPayload;
+  stvBadges: SevenTVBadge[];
+};
+
 type TwitchConn = {
   channel: string;
   irc: WebSocket | null;
@@ -107,6 +128,31 @@ function parseTags(tagStr: string) {
   return out;
 }
 
+function pick7tvBestFile(host: any): string {
+  const hostUrlRaw = String(host?.url ?? "");
+  const hostUrl = httpsify(hostUrlRaw);
+  const files: any[] = Array.isArray(host?.files) ? host.files : [];
+  if (!hostUrl || files.length === 0) return "";
+
+  const byFmt = (fmt: string) => files.filter((f) => String(f?.format ?? "").toLowerCase() === fmt);
+
+  const pickFrom = (arr: any[]) =>
+    arr.find((f) => String(f?.name ?? "").includes("2x")) ||
+    arr.find((f) => String(f?.name ?? "").includes("3x")) ||
+    arr[0];
+
+  const f =
+    pickFrom(byFmt("webp")) ||
+    pickFrom(byFmt("avif")) ||
+    pickFrom(byFmt("gif")) ||
+    pickFrom(files);
+
+  const fileName = String(f?.name ?? "");
+  if (!fileName) return "";
+
+  return `${hostUrl}/${fileName}`;
+}
+
 function httpsify(u: string) {
   if (!u) return "";
   if (u.startsWith("//")) return "https:" + u;
@@ -124,6 +170,80 @@ async function httpJson(url: string) {
   });
   if (!res.ok) throw new Error(`fetch failed ${res.status} ${url}`);
   return res.json();
+}
+
+async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<CosmeticsPayload> {
+  const url = `https://7tv.io/v3/users/twitch/${encodeURIComponent(twitchUserId)}`;
+  const j: any = await httpJson(url);
+
+  // -------- Paint (defensiv) --------
+  const paintObj =
+    j?.style?.paint ||
+    j?.style?.active_paint ||
+    j?.cosmetics?.paint ||
+    j?.cosmetics?.active_paint ||
+    j?.paint ||
+    null;
+
+  let paint: PaintPayload = null;
+  if (paintObj) {
+    const angle = Number(paintObj?.angle ?? 0);
+    const stopsRaw = paintObj?.gradient?.stops || paintObj?.stops || null;
+
+    const stops: { at: number; color: string }[] = Array.isArray(stopsRaw)
+      ? stopsRaw
+        .map((s: any) => ({
+          at: Math.max(0, Math.min(1, Number(s?.at ?? s?.position ?? 0))),
+          color: String(s?.color ?? s?.value ?? ""),
+        }))
+        .filter((s: any) => s.color)
+      : [];
+
+    const single = String(paintObj?.color ?? "");
+    const normalizedStops = stops.length > 0 ? stops : (single ? [{ at: 0, color: single }, { at: 1, color: single }] : []);
+
+    if (normalizedStops.length > 0) {
+      const shadowColor = String(paintObj?.shadow_color ?? paintObj?.shadowColor ?? "");
+      const shadow = shadowColor ? `0 0 10px ${shadowColor}` : undefined;
+      paint = { kind: "linear", angle: Number.isFinite(angle) ? angle : 0, stops: normalizedStops, shadow };
+    }
+  }
+
+  // -------- 7TV Badges (defensiv) --------
+  // Je nach Schema kann es badge oder badges sein
+  const badgesRaw =
+    j?.style?.badges ||
+    j?.style?.badge ||
+    j?.cosmetics?.badges ||
+    j?.cosmetics?.badge ||
+    j?.badges ||
+    null;
+
+  const stvBadges: SevenTVBadge[] = [];
+  const pushBadge = (b: any) => {
+    if (!b) return;
+
+    // häufig: b.host mit files, oder b.data.host, oder b.badge.host
+    const host = b?.host || b?.data?.host || b?.badge?.host || null;
+    const url = host ? pick7tvBestFile(host) : "";
+    if (!url) return;
+
+    stvBadges.push({
+      id: b?.id ? String(b.id) : undefined,
+      name: b?.name ? String(b.name) : undefined,
+      tooltip: b?.tooltip ? String(b.tooltip) : (b?.name ? String(b.name) : undefined),
+      url,
+    });
+  };
+
+  if (Array.isArray(badgesRaw)) {
+    badgesRaw.forEach(pushBadge);
+  } else {
+    // single badge object
+    pushBadge(badgesRaw);
+  }
+
+  return { paint, stvBadges };
 }
 
 async function getTwitchAppToken(): Promise<string> {
@@ -263,6 +383,27 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
   return { ...globalBadges.map, ...chMap };
 }
 
+async function ensureCosmetics(userId: string): Promise<CosmeticsPayload> {
+  const now = Date.now();
+  const cached = cosmeticsCache.get(userId);
+  if (cached?.loadedAt && now - cached.loadedAt < COSMETICS_TTL_MS) return cached.data;
+
+  if (cosmeticsInflight.has(userId)) return cached?.data ?? { paint: null, stvBadges: [] };
+  cosmeticsInflight.add(userId);
+
+  try {
+    const data = await fetch7TVCosmeticsForTwitchUser(userId);
+    cosmeticsCache.set(userId, { loadedAt: now, data });
+    return data;
+  } catch {
+    const fallback = cached?.data ?? { paint: null, stvBadges: [] };
+    cosmeticsCache.set(userId, { loadedAt: now, data: fallback });
+    return fallback;
+  } finally {
+    cosmeticsInflight.delete(userId);
+  }
+}
+
 
 async function fetchProfileConfig(profileId: string): Promise<ProfileConfig | null> {
   if (!supabase) return null;
@@ -289,6 +430,10 @@ const globalAssets: { loadedAt: number; map: EmoteMap } = { loadedAt: 0, map: {}
 const channelAssets = new Map<string, { loadedAt: number; map: EmoteMap; twitchId?: string }>();
 const globalBadges: { loadedAt: number; map: BadgeMap } = { loadedAt: 0, map: {} };
 const channelBadges = new Map<string, { loadedAt: number; map: BadgeMap; roomId?: string }>();
+
+const cosmeticsCache = new Map<string, { loadedAt: number; data: CosmeticsPayload }>();
+const cosmeticsInflight = new Set<string>();
+const COSMETICS_TTL_MS = Math.max(60_000, Number(process.env.COSMETICS_TTL_MS ?? 10 * 60 * 1000));
 
 function mergeEmotes(into: EmoteMap, from: EmoteMap) {
   for (const [code, v] of Object.entries(from)) {
@@ -630,6 +775,13 @@ function connectTwitch(conn: TwitchConn) {
         user_id: tags["user-id"] || "",
         room_id: tags["room-id"] || "",
       });
+      const uidTag = tags["user-id"];
+      if (uidTag) {
+        void (async () => {
+          const data = await ensureCosmetics(String(uidTag));
+          broadcast(conn, { type: "cosmetics", user_id: String(uidTag), paint: data.paint, stvBadges: data.stvBadges });
+        })();
+      }
     }
   };
 
