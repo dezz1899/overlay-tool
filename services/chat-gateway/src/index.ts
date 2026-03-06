@@ -347,6 +347,23 @@ function normalize7tvBadge(b: any): SevenTVBadge | null {
   };
 }
 
+function build7tvBadgeCdnUrl(badgeId: string, size: "1x" | "2x" | "3x" | "4x" = "3x"): string {
+  const id = String(badgeId ?? "").trim();
+  if (!id) return "";
+  return `https://cdn.7tv.app/badge/${encodeURIComponent(id)}/${size}.webp`;
+}
+
+async function fetch7tvUserById(sevenTvUserId: string, debugUserId?: string): Promise<any | null> {
+  const id = String(sevenTvUserId ?? "").trim();
+  if (!id) return null;
+
+  const url = `https://7tv.io/v3/users/${encodeURIComponent(id)}`;
+  const r = await httpJsonWithDebug(url, debugUserId);
+
+  if (!r.ok || !r.json) return null;
+  return r.json;
+}
+
 async function httpJsonWithDebug(url: string, debugUserId?: string): Promise<{ ok: boolean; status: number; json: any | null; textSnippet: string }> {
   const res = await fetch(url, {
     headers: {
@@ -948,6 +965,31 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
     "",
   ).trim();
 
+  const sevenTvUserId = String(
+    j?.user?.id ??
+    j?.id ??
+    "",
+  ).trim();
+
+  let jById: any = null;
+  if (sevenTvUserId && sevenTvUserId !== twitchUserId) {
+    jById = await fetch7tvUserById(sevenTvUserId, twitchUserId);
+
+    if (isDebug7tvUser(twitchUserId)) {
+      console.log(
+        "[7TV][USER_BY_ID]",
+        JSON.stringify({
+          userId: twitchUserId,
+          sevenTvUserId,
+          ok: !!jById,
+          topLevelKeys: objectKeys(jById),
+          styleKeys: objectKeys(jById?.style),
+          userKeys: objectKeys(jById?.user),
+        }),
+      );
+    }
+  }
+
   const styleRoleIds = Array.isArray(j?.user?.role_ids)
     ? j.user.role_ids.map((x: any) => String(x))
     : Array.isArray(j?.role_ids)
@@ -997,38 +1039,68 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
   });
 
   let paint: PaintPayload = null;
-  for (const candidate of collectPaintCandidates(j)) {
-    paint = normalizePaintPayload(candidate);
-    if (paint) break;
-  }
 
-  if (!paint && stylePaintId) {
-    paint = await resolve7tvPaintById(stylePaintId, twitchUserId);
+  for (const source of [jById, j]) {
+    if (!source) continue;
+
+    for (const candidate of collectPaintCandidates(source)) {
+      paint = normalizePaintPayload(candidate);
+      if (paint) break;
+    }
+
+    if (paint) break;
   }
 
   const stvBadges: SevenTVBadge[] = [];
   const seen = new Set<string>();
 
-  for (const badgeNode of collectBadgeCandidates(j)) {
-    const normalized = normalize7tvBadge(badgeNode);
-    if (!normalized) continue;
+  for (const source of [jById, j]) {
+    if (!source) continue;
 
-    const dedupeKey = normalized.id || normalized.url;
-    if (!dedupeKey || seen.has(dedupeKey)) continue;
+    for (const badgeNode of collectBadgeCandidates(source)) {
+      const normalized = normalize7tvBadge(badgeNode);
+      if (!normalized) continue;
 
-    seen.add(dedupeKey);
-    stvBadges.push(normalized);
+      const dedupeKey = normalized.id || normalized.url;
+      if (!dedupeKey || seen.has(dedupeKey)) continue;
+
+      seen.add(dedupeKey);
+      stvBadges.push(normalized);
+    }
   }
 
+  // Fallback: Badge direkt über CDN bauen, genau wie in deinem ChatIS-Screenshot
   if (stvBadges.length === 0 && styleBadgeId) {
-    const resolvedBadge = await resolve7tvBadgeById(styleBadgeId, twitchUserId);
-    if (resolvedBadge) {
-      const dedupeKey = resolvedBadge.id || resolvedBadge.url;
-      if (dedupeKey && !seen.has(dedupeKey)) {
-        seen.add(dedupeKey);
-        stvBadges.push(resolvedBadge);
+    const fallbackUrl = build7tvBadgeCdnUrl(styleBadgeId, "3x");
+    if (fallbackUrl) {
+      stvBadges.push({
+        id: styleBadgeId,
+        url: fallbackUrl,
+        tooltip: "7TV Badge",
+      });
+
+      if (isDebug7tvUser(twitchUserId)) {
+        console.log(
+          "[7TV][BADGE_CDN_FALLBACK]",
+          JSON.stringify({
+            userId: twitchUserId,
+            badgeId: styleBadgeId,
+            url: fallbackUrl,
+          }),
+        );
       }
     }
+  }
+
+  if (isDebug7tvUser(twitchUserId) && !paint && stylePaintId) {
+    console.log(
+      "[7TV][PAINT_STILL_MISSING]",
+      JSON.stringify({
+        userId: twitchUserId,
+        stylePaintId,
+        note: "paint_id exists but no embedded paint object was found even after /v3/users/<7tvUserId> lookup",
+      }),
+    );
   }
 
   if (isDebug7tvUser(twitchUserId)) {
