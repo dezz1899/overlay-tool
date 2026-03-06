@@ -718,6 +718,7 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
       }),
     );
   }
+  
   if (isDebug7tvUser(twitchUserId)) {
     console.log(
       "[7TV][CONNECTIONS]",
