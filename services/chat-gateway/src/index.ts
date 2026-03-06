@@ -346,6 +346,189 @@ function normalize7tvBadge(b: any): SevenTVBadge | null {
   };
 }
 
+async function httpJsonWithDebug(url: string, debugUserId?: string): Promise<{ ok: boolean; status: number; json: any | null; textSnippet: string }> {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json",
+    },
+  });
+
+  const text = await res.text();
+  let json: any = null;
+
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+
+  if (debugUserId && isDebug7tvUser(debugUserId)) {
+    console.log(
+      "[7TV][HTTP_PROBE]",
+      JSON.stringify({
+        userId: debugUserId,
+        url,
+        status: res.status,
+        jsonTopLevelKeys: objectKeys(json),
+        textSnippet: text.slice(0, 180),
+      }),
+    );
+  }
+
+  return {
+    ok: res.ok,
+    status: res.status,
+    json,
+    textSnippet: text.slice(0, 180),
+  };
+}
+
+function extractPaintLikeObject(raw: any): any | null {
+  return firstNonNull(
+    raw?.paint,
+    raw?.data?.paint,
+    raw?.object?.paint,
+    raw?.item?.paint,
+    raw?.cosmetic?.paint,
+    raw?.data,
+    raw?.object,
+    raw?.item,
+    raw?.cosmetic,
+    raw,
+  );
+}
+
+function extractBadgeLikeObject(raw: any): any | null {
+  return firstNonNull(
+    raw?.badge,
+    raw?.data?.badge,
+    raw?.object?.badge,
+    raw?.item?.badge,
+    raw?.cosmetic?.badge,
+    raw?.data,
+    raw?.object,
+    raw?.item,
+    raw?.cosmetic,
+    raw,
+  );
+}
+
+async function resolve7tvPaintById(paintId: string, debugUserId?: string): Promise<PaintPayload> {
+  const id = String(paintId || "").trim();
+  if (!id) return null;
+
+  const candidates = [
+    `https://7tv.io/v3/paints/${encodeURIComponent(id)}`,
+    `https://7tv.io/v3/cosmetics/${encodeURIComponent(id)}`,
+  ];
+
+  for (const url of candidates) {
+    try {
+      const r = await httpJsonWithDebug(url, debugUserId);
+      if (!r.ok || !r.json) continue;
+
+      const raw = extractPaintLikeObject(r.json);
+      const paint = normalizePaintPayload(raw);
+      if (paint) {
+        if (debugUserId && isDebug7tvUser(debugUserId)) {
+          console.log(
+            "[7TV][PAINT_RESOLVED]",
+            JSON.stringify({
+              userId: debugUserId,
+              paintId: id,
+              url,
+            }),
+          );
+        }
+        return paint;
+      }
+    } catch (e: any) {
+      if (debugUserId && isDebug7tvUser(debugUserId)) {
+        console.log(
+          "[7TV][PAINT_RESOLVE_ERROR]",
+          JSON.stringify({
+            userId: debugUserId,
+            paintId: id,
+            url,
+            error: String(e?.message ?? e),
+          }),
+        );
+      }
+    }
+  }
+
+  if (debugUserId && isDebug7tvUser(debugUserId)) {
+    console.log(
+      "[7TV][PAINT_RESOLVE_MISS]",
+      JSON.stringify({
+        userId: debugUserId,
+        paintId: id,
+      }),
+    );
+  }
+
+  return null;
+}
+
+async function resolve7tvBadgeById(badgeId: string, debugUserId?: string): Promise<SevenTVBadge | null> {
+  const id = String(badgeId || "").trim();
+  if (!id) return null;
+
+  const candidates = [
+    `https://7tv.io/v3/badges/${encodeURIComponent(id)}`,
+    `https://7tv.io/v3/cosmetics/${encodeURIComponent(id)}`,
+  ];
+
+  for (const url of candidates) {
+    try {
+      const r = await httpJsonWithDebug(url, debugUserId);
+      if (!r.ok || !r.json) continue;
+
+      const raw = extractBadgeLikeObject(r.json);
+      const badge = normalize7tvBadge(raw);
+      if (badge) {
+        if (debugUserId && isDebug7tvUser(debugUserId)) {
+          console.log(
+            "[7TV][BADGE_RESOLVED]",
+            JSON.stringify({
+              userId: debugUserId,
+              badgeId: id,
+              url,
+              badgeName: badge.name ?? badge.tooltip ?? null,
+            }),
+          );
+        }
+        return badge;
+      }
+    } catch (e: any) {
+      if (debugUserId && isDebug7tvUser(debugUserId)) {
+        console.log(
+          "[7TV][BADGE_RESOLVE_ERROR]",
+          JSON.stringify({
+            userId: debugUserId,
+            badgeId: id,
+            url,
+            error: String(e?.message ?? e),
+          }),
+        );
+      }
+    }
+  }
+
+  if (debugUserId && isDebug7tvUser(debugUserId)) {
+    console.log(
+      "[7TV][BADGE_RESOLVE_MISS]",
+      JSON.stringify({
+        userId: debugUserId,
+        badgeId: id,
+      }),
+    );
+  }
+
+  return null;
+}
+
 function collectPaintCandidates(raw: any): any[] {
   const out: any[] = [];
 
@@ -542,6 +725,10 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
     if (paint) break;
   }
 
+  if (!paint && stylePaintId) {
+    paint = await resolve7tvPaintById(stylePaintId, twitchUserId);
+  }
+
   const stvBadges: SevenTVBadge[] = [];
   const seen = new Set<string>();
 
@@ -554,6 +741,17 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
 
     seen.add(dedupeKey);
     stvBadges.push(normalized);
+  }
+
+  if (stvBadges.length === 0 && styleBadgeId) {
+    const resolvedBadge = await resolve7tvBadgeById(styleBadgeId, twitchUserId);
+    if (resolvedBadge) {
+      const dedupeKey = resolvedBadge.id || resolvedBadge.url;
+      if (dedupeKey && !seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        stvBadges.push(resolvedBadge);
+      }
+    }
   }
 
   if (isDebug7tvUser(twitchUserId)) {
