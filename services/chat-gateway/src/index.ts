@@ -31,6 +31,7 @@ let lastBadgeChannelCount = 0;
 
 const DEBUG_7TV_USER_ID = String(process.env.DEBUG_7TV_USER_ID ?? "").trim();
 const DEBUG_7TV_WS = String(process.env.DEBUG_7TV_WS ?? "").trim() === "1";
+const DEBUG_7TV_EVENTS = String(process.env.DEBUG_7TV_EVENTS ?? "").trim() === "1";
 
 // ---------- types ----------
 type Roleless = any;
@@ -643,6 +644,248 @@ function collectBadgeCandidates(raw: any): any[] {
   return out.filter(Boolean);
 }
 
+function pickDebug7tvConnection(rawUserPayload: any, twitchUserId: string) {
+  const connections = Array.isArray(rawUserPayload?.user?.connections) ? rawUserPayload.user.connections : [];
+  return (
+    connections.find((c: any) => String(c?.platform ?? "").toUpperCase() === "TWITCH" && String(c?.id ?? "") === String(twitchUserId)) ||
+    connections.find((c: any) => String(c?.platform ?? "").toUpperCase() === "TWITCH") ||
+    null
+  );
+}
+
+function summarize7tvEventDispatch(msg: any) {
+  const body = msg?.d?.body ?? {};
+  const takeKeys = (arr: any) =>
+    Array.isArray(arr)
+      ? arr.slice(0, 8).map((x: any) => ({
+        key: x?.key ?? null,
+        index: x?.index ?? null,
+        nested: !!x?.nested,
+        valueKeys: objectKeys(x?.value, 8),
+        oldValueKeys: objectKeys(x?.old_value, 8),
+      }))
+      : [];
+
+  return {
+    type: msg?.d?.type ?? null,
+    bodyId: body?.id ?? null,
+    kind: body?.kind ?? null,
+    actorId: body?.actor?.id ?? null,
+    actorStyle: body?.actor?.style ?? null,
+    added: takeKeys(body?.added),
+    updated: takeKeys(body?.updated),
+    removed: takeKeys(body?.removed),
+    pushed: takeKeys(body?.pushed),
+    pulled: takeKeys(body?.pulled),
+  };
+}
+
+function start7tvDebugEventStream(opts: {
+  debugUserId: string;
+  hostIdCandidate?: string | null;
+  connectionIdCandidate?: string | null;
+}) {
+  if (!DEBUG_7TV_EVENTS) return;
+  if (!isDebug7tvUser(opts.debugUserId)) return;
+
+  const hostId = String(opts.hostIdCandidate ?? "").trim();
+  const connectionId = String(opts.connectionIdCandidate ?? "").trim();
+
+  if (!hostId || !connectionId) {
+    console.log(
+      "[7TV][EV_SKIP]",
+      JSON.stringify({
+        userId: opts.debugUserId,
+        reason: "missing hostId or connectionId",
+        hostId: hostId || null,
+        connectionId: connectionId || null,
+      }),
+    );
+    return;
+  }
+
+  const nextKey = `${hostId}:${connectionId}`;
+  if (
+    sevenTvDebugEventsWs &&
+    sevenTvDebugEventsWs.readyState === WebSocket.OPEN &&
+    sevenTvDebugEventsKey === nextKey
+  ) {
+    return;
+  }
+
+  if (sevenTvDebugEventsWs) {
+    try {
+      sevenTvDebugEventsWs.close();
+    } catch { }
+    sevenTvDebugEventsWs = null;
+    sevenTvDebugEventsKey = "";
+  }
+
+  const ev = new WebSocket("wss://events.7tv.io/v3");
+  sevenTvDebugEventsWs = ev;
+  sevenTvDebugEventsKey = nextKey;
+
+  ev.on("open", () => {
+    console.log(
+      "[7TV][EV_OPEN]",
+      JSON.stringify({
+        userId: opts.debugUserId,
+        hostId,
+        connectionId,
+      }),
+    );
+  });
+
+  ev.on("message", (raw: RawData) => {
+    let msg: any = null;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch (e: any) {
+      console.log(
+        "[7TV][EV_PARSE_ERROR]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          error: String(e?.message ?? e),
+          raw: String(raw).slice(0, 300),
+        }),
+      );
+      return;
+    }
+
+    const op = Number(msg?.op ?? -1);
+
+    if (op === 1) {
+      console.log(
+        "[7TV][EV_HELLO]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          hello: msg?.d ?? null,
+        }),
+      );
+
+      const subs = [
+        { type: "user.update", condition: { object_id: hostId } },
+        { type: "entitlement.*", condition: { host_id: hostId, connection_id: connectionId } },
+        { type: "cosmetic.*", condition: { host_id: hostId, connection_id: connectionId } },
+      ];
+
+      for (const sub of subs) {
+        try {
+          ev.send(JSON.stringify({ op: 35, d: sub }));
+          console.log(
+            "[7TV][EV_SUB_SENT]",
+            JSON.stringify({
+              userId: opts.debugUserId,
+              sub,
+            }),
+          );
+        } catch (e: any) {
+          console.log(
+            "[7TV][EV_SUB_SEND_ERROR]",
+            JSON.stringify({
+              userId: opts.debugUserId,
+              sub,
+              error: String(e?.message ?? e),
+            }),
+          );
+        }
+      }
+      return;
+    }
+
+    if (op === 5) {
+      console.log(
+        "[7TV][EV_ACK]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          ack: msg?.d ?? null,
+        }),
+      );
+      return;
+    }
+
+    if (op === 6) {
+      console.log(
+        "[7TV][EV_ERROR]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          error: msg?.d ?? null,
+        }),
+      );
+      return;
+    }
+
+    if (op === 0) {
+      console.log(
+        "[7TV][EV_DISPATCH]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          summary: summarize7tvEventDispatch(msg),
+        }),
+      );
+      return;
+    }
+
+    if (op === 4 || op === 7) {
+      console.log(
+        "[7TV][EV_CLOSE_HINT]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          op,
+          payload: msg?.d ?? null,
+        }),
+      );
+      return;
+    }
+
+    if (op === 2) {
+      console.log(
+        "[7TV][EV_HEARTBEAT]",
+        JSON.stringify({
+          userId: opts.debugUserId,
+          payload: msg?.d ?? null,
+        }),
+      );
+      return;
+    }
+
+    console.log(
+      "[7TV][EV_OTHER]",
+      JSON.stringify({
+        userId: opts.debugUserId,
+        op,
+        payload: msg?.d ?? null,
+      }),
+    );
+  });
+
+  ev.on("close", (code, reason) => {
+    console.log(
+      "[7TV][EV_CLOSED]",
+      JSON.stringify({
+        userId: opts.debugUserId,
+        code,
+        reason: String(reason || ""),
+      }),
+    );
+
+    if (sevenTvDebugEventsWs === ev) {
+      sevenTvDebugEventsWs = null;
+      sevenTvDebugEventsKey = "";
+    }
+  });
+
+  ev.on("error", (err: any) => {
+    console.log(
+      "[7TV][EV_SOCKET_ERROR]",
+      JSON.stringify({
+        userId: opts.debugUserId,
+        error: String(err?.message ?? err),
+      }),
+    );
+  });
+}
+
 async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<CosmeticsPayload> {
   const url = `https://7tv.io/v3/users/twitch/${encodeURIComponent(twitchUserId)}`;
 
@@ -718,7 +961,7 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
       }),
     );
   }
-  
+
   if (isDebug7tvUser(twitchUserId)) {
     console.log(
       "[7TV][CONNECTIONS]",
@@ -740,6 +983,14 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
       }),
     );
   }
+
+  const debugConn = pickDebug7tvConnection(j, twitchUserId);
+
+  start7tvDebugEventStream({
+    debugUserId: twitchUserId,
+    hostIdCandidate: String(j?.user?.id ?? "").trim() || null,
+    connectionIdCandidate: String(debugConn?.id ?? "").trim() || null,
+  });
 
   let paint: PaintPayload = null;
   for (const candidate of collectPaintCandidates(j)) {
@@ -1031,6 +1282,9 @@ const channelBadges = new Map<string, { loadedAt: number; map: BadgeMap; roomId?
 const cosmeticsCache = new Map<string, { loadedAt: number; data: CosmeticsPayload }>();
 const cosmeticsInflight = new Set<string>();
 const COSMETICS_TTL_MS = Math.max(60_000, Number(process.env.COSMETICS_TTL_MS ?? 10 * 60 * 1000));
+
+let sevenTvDebugEventsWs: WebSocket | null = null;
+let sevenTvDebugEventsKey = "";
 
 function mergeEmotes(into: EmoteMap, from: EmoteMap) {
   for (const [code, v] of Object.entries(from)) {
