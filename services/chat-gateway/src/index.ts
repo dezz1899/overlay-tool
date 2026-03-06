@@ -506,6 +506,36 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
 
   log7tvDebug(twitchUserId, "user-payload", j, { status: res.status });
 
+  const stylePaintId = String(
+    j?.user?.style?.paint_id ??
+    j?.style?.paint_id ??
+    "",
+  ).trim();
+
+  const styleBadgeId = String(
+    j?.user?.style?.badge_id ??
+    j?.style?.badge_id ??
+    "",
+  ).trim();
+
+  const styleRoleIds = Array.isArray(j?.user?.role_ids)
+    ? j.user.role_ids.map((x: any) => String(x))
+    : Array.isArray(j?.role_ids)
+      ? j.role_ids.map((x: any) => String(x))
+      : [];
+
+  if (isDebug7tvUser(twitchUserId)) {
+    console.log(
+      "[7TV][STYLE_IDS]",
+      JSON.stringify({
+        userId: twitchUserId,
+        stylePaintId: stylePaintId || null,
+        styleBadgeId: styleBadgeId || null,
+        styleRoleIds,
+      }),
+    );
+  }
+
   let paint: PaintPayload = null;
   for (const candidate of collectPaintCandidates(j)) {
     paint = normalizePaintPayload(candidate);
@@ -536,6 +566,30 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
         badgeNames: stvBadges.slice(0, 5).map((b) => b.name ?? b.tooltip ?? b.id ?? "badge"),
       }),
     );
+
+    if (!paint && stylePaintId) {
+      console.log(
+        "[7TV][PAINT_ID_ONLY]",
+        JSON.stringify({
+          userId: twitchUserId,
+          paintId: stylePaintId,
+          note: "User payload exposes paint_id, not an embedded paint object. A second lookup is required.",
+        }),
+      );
+    }
+
+    if (stvBadges.length === 0) {
+      console.log(
+        "[7TV][BADGE_STATUS]",
+        JSON.stringify({
+          userId: twitchUserId,
+          badgeId: styleBadgeId || null,
+          note: styleBadgeId
+            ? "badge_id exists but badge object was not resolved"
+            : "no badge_id visible in this payload",
+        }),
+      );
+    }
   }
 
   return { paint, stvBadges };
