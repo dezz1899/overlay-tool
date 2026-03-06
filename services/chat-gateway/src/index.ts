@@ -364,6 +364,69 @@ async function fetch7tvUserById(sevenTvUserId: string, debugUserId?: string): Pr
   return r.json;
 }
 
+function findObjectsByIdDeep(
+  value: unknown,
+  wantedId: string,
+  depth = 0,
+  out: any[] = [],
+  seen = new Set<any>(),
+): any[] {
+  if (!value || depth > 7) return out;
+  if (typeof value !== "object") return out;
+  if (seen.has(value)) return out;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      findObjectsByIdDeep(item, wantedId, depth + 1, out, seen);
+      if (out.length >= 20) break;
+    }
+    return out;
+  }
+
+  const obj = value as Record<string, unknown>;
+
+  if (String(obj.id ?? "") === wantedId) {
+    out.push(obj);
+  }
+
+  for (const v of Object.values(obj)) {
+    findObjectsByIdDeep(v, wantedId, depth + 1, out, seen);
+    if (out.length >= 20) break;
+  }
+
+  return out;
+}
+
+function collectPaintCandidatesIncludingRoles(raw: any): any[] {
+  const out = collectPaintCandidates(raw);
+
+  for (const role of asArray(raw?.roles)) {
+    out.push(role?.style?.paint);
+    out.push(role?.style?.active_paint);
+    out.push(role?.style?.activePaint);
+    out.push(role?.paint);
+    out.push(role?.data?.paint);
+  }
+
+  return out.filter(Boolean);
+}
+
+function collectBadgeCandidatesIncludingRoles(raw: any): any[] {
+  const out = collectBadgeCandidates(raw);
+
+  for (const role of asArray(raw?.roles)) {
+    out.push(...asArray(role?.style?.badge));
+    out.push(...asArray(role?.style?.badges));
+    out.push(...asArray(role?.badge));
+    out.push(...asArray(role?.badges));
+    out.push(...asArray(role?.data?.badge));
+    out.push(...asArray(role?.data?.badges));
+  }
+
+  return out.filter(Boolean);
+}
+
 async function httpJsonWithDebug(url: string, debugUserId?: string): Promise<{ ok: boolean; status: number; json: any | null; textSnippet: string }> {
   const res = await fetch(url, {
     headers: {
@@ -985,6 +1048,14 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
           topLevelKeys: objectKeys(jById),
           styleKeys: objectKeys(jById?.style),
           userKeys: objectKeys(jById?.user),
+          roleCount: Array.isArray(jById?.roles) ? jById.roles.length : 0,
+          roleSummaries: Array.isArray(jById?.roles)
+            ? jById.roles.slice(0, 5).map((r: any) => ({
+              id: r?.id ?? null,
+              keys: objectKeys(r),
+              styleKeys: objectKeys(r?.style),
+            }))
+            : [],
         }),
       );
     }
@@ -1043,12 +1114,49 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
   for (const source of [jById, j]) {
     if (!source) continue;
 
-    for (const candidate of collectPaintCandidates(source)) {
+    for (const candidate of collectPaintCandidatesIncludingRoles(source)) {
       paint = normalizePaintPayload(candidate);
       if (paint) break;
     }
 
     if (paint) break;
+  }
+
+  if (!paint && stylePaintId) {
+    for (const source of [jById, j]) {
+      if (!source) continue;
+
+      const deepMatches = findObjectsByIdDeep(source, stylePaintId);
+
+      if (isDebug7tvUser(twitchUserId) && deepMatches.length > 0) {
+        console.log(
+          "[7TV][PAINT_ID_DEEP_MATCHES]",
+          JSON.stringify({
+            userId: twitchUserId,
+            stylePaintId,
+            count: deepMatches.length,
+            samples: deepMatches.slice(0, 5).map((x: any) => ({
+              keys: objectKeys(x),
+              id: x?.id ?? null,
+              kind: x?.kind ?? x?.type ?? null,
+            })),
+          }),
+        );
+      }
+
+      for (const match of deepMatches) {
+        paint =
+          normalizePaintPayload(match) ||
+          normalizePaintPayload(match?.data) ||
+          normalizePaintPayload(match?.paint) ||
+          normalizePaintPayload(match?.style?.paint) ||
+          null;
+
+        if (paint) break;
+      }
+
+      if (paint) break;
+    }
   }
 
   const stvBadges: SevenTVBadge[] = [];
@@ -1057,7 +1165,7 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
   for (const source of [jById, j]) {
     if (!source) continue;
 
-    for (const badgeNode of collectBadgeCandidates(source)) {
+    for (const badgeNode of collectBadgeCandidatesIncludingRoles(source)) {
       const normalized = normalize7tvBadge(badgeNode);
       if (!normalized) continue;
 
