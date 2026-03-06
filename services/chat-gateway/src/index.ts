@@ -29,6 +29,9 @@ let lastBadgeError: string | null = null;
 let lastBadgeGlobalCount = 0;
 let lastBadgeChannelCount = 0;
 
+const DEBUG_7TV_USER_ID = String(process.env.DEBUG_7TV_USER_ID ?? "").trim();
+const DEBUG_7TV_WS = String(process.env.DEBUG_7TV_WS ?? "").trim() === "1";
+
 // ---------- types ----------
 type Roleless = any;
 
@@ -172,75 +175,367 @@ async function httpJson(url: string) {
   return res.json();
 }
 
-async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<CosmeticsPayload> {
-  const url = `https://7tv.io/v3/users/twitch/${encodeURIComponent(twitchUserId)}`;
-  const j: any = await httpJson(url);
+function isDebug7tvUser(userId?: string | null): boolean {
+  return !!DEBUG_7TV_USER_ID && String(userId ?? "") === DEBUG_7TV_USER_ID;
+}
 
-  // -------- Paint (defensiv) --------
-  const paintObj =
-    j?.style?.paint ||
-    j?.style?.active_paint ||
-    j?.cosmetics?.paint ||
-    j?.cosmetics?.active_paint ||
-    j?.paint ||
+function objectKeys(value: unknown, limit = 20): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>).slice(0, limit);
+}
+
+function asArray<T>(value: T | T[] | null | undefined): T[] {
+  if (Array.isArray(value)) return value;
+  return value == null ? [] : [value];
+}
+
+function firstNonNull<T>(...values: Array<T | null | undefined>): T | null {
+  for (const v of values) {
+    if (v != null) return v;
+  }
+  return null;
+}
+
+function summarizeNode(value: unknown): string {
+  if (value == null) return "null";
+  if (Array.isArray(value)) return `array(${value.length})`;
+  if (typeof value === "object") {
+    return `object(${Object.keys(value as Record<string, unknown>).slice(0, 8).join(",")})`;
+  }
+  if (typeof value === "string") return `string(${value.slice(0, 48)})`;
+  return String(value);
+}
+
+function collectInteresting7tvPaths(
+  value: unknown,
+  path = "$",
+  depth = 0,
+  out: string[] = [],
+): string[] {
+  if (depth > 5 || out.length >= 30 || value == null || typeof value !== "object") return out;
+
+  if (Array.isArray(value)) {
+    for (let i = 0; i < Math.min(value.length, 3); i += 1) {
+      collectInteresting7tvPaths(value[i], `${path}[${i}]`, depth + 1, out);
+      if (out.length >= 30) break;
+    }
+    return out;
+  }
+
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    const next = `${path}.${k}`;
+
+    if (/(paint|badge|cosmetic|entitlement|style|active|selected|connection)/i.test(k)) {
+      out.push(`${next} => ${summarizeNode(v)}`);
+      if (out.length >= 30) break;
+    }
+
+    collectInteresting7tvPaths(v, next, depth + 1, out);
+    if (out.length >= 30) break;
+  }
+
+  return out;
+}
+
+function build7tvDebugSummary(raw: any) {
+  return {
+    topLevelKeys: objectKeys(raw),
+    styleKeys: objectKeys(raw?.style),
+    cosmeticsKeys: objectKeys(raw?.cosmetics),
+    userKeys: objectKeys(raw?.user),
+    entitlementsSummary: Array.isArray(raw?.entitlements)
+      ? raw.entitlements.slice(0, 5).map((x: any) => ({
+        keys: objectKeys(x),
+        kind: x?.kind ?? x?.type ?? null,
+        id: x?.id ?? null,
+      }))
+      : null,
+    connectionsSummary: Array.isArray(raw?.connections)
+      ? raw.connections.slice(0, 3).map((x: any) => ({
+        keys: objectKeys(x),
+        id: x?.id ?? x?.connection_id ?? x?.platform_id ?? null,
+        platform: x?.platform ?? x?.kind ?? x?.type ?? null,
+      }))
+      : null,
+    interestingPaths: collectInteresting7tvPaths(raw),
+  };
+}
+
+function log7tvDebug(userId: string, stage: string, raw: any, extra: Record<string, unknown> = {}) {
+  if (!isDebug7tvUser(userId)) return;
+  console.log(
+    "[7TV][DEBUG]",
+    JSON.stringify({
+      userId,
+      stage,
+      ...extra,
+      summary: build7tvDebugSummary(raw),
+    }),
+  );
+}
+
+function normalizePaintPayload(paintObj: any): PaintPayload {
+  if (!paintObj) return null;
+
+  const angle = Number(paintObj?.angle ?? 0);
+  const stopsRaw = paintObj?.gradient?.stops || paintObj?.stops || null;
+
+  const stops: { at: number; color: string }[] = Array.isArray(stopsRaw)
+    ? stopsRaw
+      .map((s: any) => ({
+        at: Math.max(0, Math.min(1, Number(s?.at ?? s?.position ?? 0))),
+        color: String(s?.color ?? s?.value ?? ""),
+      }))
+      .filter((s: any) => s.color)
+    : [];
+
+  const single = String(paintObj?.color ?? "");
+  const normalizedStops =
+    stops.length > 0
+      ? stops
+      : single
+        ? [{ at: 0, color: single }, { at: 1, color: single }]
+        : [];
+
+  if (normalizedStops.length === 0) return null;
+
+  const shadowColor = String(paintObj?.shadow_color ?? paintObj?.shadowColor ?? "");
+  const shadow = shadowColor ? `0 0 10px ${shadowColor}` : undefined;
+
+  return {
+    kind: "linear",
+    angle: Number.isFinite(angle) ? angle : 0,
+    stops: normalizedStops,
+    shadow,
+  };
+}
+
+function normalize7tvBadge(b: any): SevenTVBadge | null {
+  if (!b) return null;
+
+  const host =
+    b?.host ||
+    b?.data?.host ||
+    b?.badge?.host ||
+    b?.data?.badge?.host ||
+    b?.cosmetic?.host ||
+    b?.item?.host ||
     null;
 
-  let paint: PaintPayload = null;
-  if (paintObj) {
-    const angle = Number(paintObj?.angle ?? 0);
-    const stopsRaw = paintObj?.gradient?.stops || paintObj?.stops || null;
+  const url =
+    (host ? pick7tvBestFile(host) : "") ||
+    httpsify(
+      String(
+        b?.url ??
+        b?.image_url_4x ??
+        b?.image_url_2x ??
+        b?.image_url_1x ??
+        b?.image_url ??
+        b?.data?.url ??
+        "",
+      ),
+    );
 
-    const stops: { at: number; color: string }[] = Array.isArray(stopsRaw)
-      ? stopsRaw
-        .map((s: any) => ({
-          at: Math.max(0, Math.min(1, Number(s?.at ?? s?.position ?? 0))),
-          color: String(s?.color ?? s?.value ?? ""),
-        }))
-        .filter((s: any) => s.color)
-      : [];
+  if (!url) return null;
 
-    const single = String(paintObj?.color ?? "");
-    const normalizedStops = stops.length > 0 ? stops : (single ? [{ at: 0, color: single }, { at: 1, color: single }] : []);
+  return {
+    id: b?.id ? String(b.id) : undefined,
+    name: b?.name ? String(b.name) : undefined,
+    tooltip: b?.tooltip ? String(b.tooltip) : (b?.name ? String(b.name) : undefined),
+    url,
+  };
+}
 
-    if (normalizedStops.length > 0) {
-      const shadowColor = String(paintObj?.shadow_color ?? paintObj?.shadowColor ?? "");
-      const shadow = shadowColor ? `0 0 10px ${shadowColor}` : undefined;
-      paint = { kind: "linear", angle: Number.isFinite(angle) ? angle : 0, stops: normalizedStops, shadow };
+function collectPaintCandidates(raw: any): any[] {
+  const out: any[] = [];
+
+  const push = (v: any) => {
+    if (v) out.push(v);
+  };
+
+  push(raw?.style?.paint);
+  push(raw?.style?.active_paint);
+  push(raw?.style?.activePaint);
+
+  push(raw?.cosmetics?.paint);
+  push(raw?.cosmetics?.active_paint);
+  push(raw?.cosmetics?.activePaint);
+
+  push(raw?.paint);
+
+  push(raw?.user?.style?.paint);
+  push(raw?.user?.style?.active_paint);
+  push(raw?.user?.style?.activePaint);
+  push(raw?.user?.cosmetics?.paint);
+  push(raw?.user?.cosmetics?.active_paint);
+  push(raw?.user?.cosmetics?.activePaint);
+  push(raw?.user?.paint);
+
+  for (const c of asArray(raw?.connections)) {
+    push(c?.style?.paint);
+    push(c?.style?.active_paint);
+    push(c?.style?.activePaint);
+    push(c?.cosmetics?.paint);
+    push(c?.cosmetics?.active_paint);
+    push(c?.cosmetics?.activePaint);
+    push(c?.user?.style?.paint);
+    push(c?.user?.style?.active_paint);
+    push(c?.user?.style?.activePaint);
+  }
+
+  for (const ent of [
+    ...asArray(raw?.entitlements),
+    ...asArray(raw?.cosmetics?.entitlements),
+    ...asArray(raw?.user?.entitlements),
+  ]) {
+    const kind = String(ent?.kind ?? ent?.type ?? "").toLowerCase();
+    const data = ent?.data ?? ent?.object ?? ent?.item ?? ent?.cosmetic ?? ent;
+
+    if (kind.includes("paint")) {
+      push(data?.paint ?? data);
+    } else {
+      push(data?.paint);
+      push(data?.style?.paint);
+      push(data?.style?.active_paint);
+      push(data?.style?.activePaint);
     }
   }
 
-  // -------- 7TV Badges (defensiv) --------
-  // Je nach Schema kann es badge oder badges sein
-  const badgesRaw =
-    j?.style?.badges ||
-    j?.style?.badge ||
-    j?.cosmetics?.badges ||
-    j?.cosmetics?.badge ||
-    j?.badges ||
-    null;
+  return out.filter(Boolean);
+}
 
-  const stvBadges: SevenTVBadge[] = [];
-  const pushBadge = (b: any) => {
-    if (!b) return;
+function collectBadgeCandidates(raw: any): any[] {
+  const out: any[] = [];
 
-    // häufig: b.host mit files, oder b.data.host, oder b.badge.host
-    const host = b?.host || b?.data?.host || b?.badge?.host || null;
-    const url = host ? pick7tvBestFile(host) : "";
-    if (!url) return;
-
-    stvBadges.push({
-      id: b?.id ? String(b.id) : undefined,
-      name: b?.name ? String(b.name) : undefined,
-      tooltip: b?.tooltip ? String(b.tooltip) : (b?.name ? String(b.name) : undefined),
-      url,
-    });
+  const pushMany = (v: any) => {
+    if (Array.isArray(v)) out.push(...v.filter(Boolean));
+    else if (v) out.push(v);
   };
 
-  if (Array.isArray(badgesRaw)) {
-    badgesRaw.forEach(pushBadge);
-  } else {
-    // single badge object
-    pushBadge(badgesRaw);
+  pushMany(raw?.style?.badges);
+  pushMany(raw?.style?.badge);
+  pushMany(raw?.style?.active_badge);
+  pushMany(raw?.style?.activeBadge);
+
+  pushMany(raw?.cosmetics?.badges);
+  pushMany(raw?.cosmetics?.badge);
+
+  pushMany(raw?.badges);
+  pushMany(raw?.badge);
+
+  pushMany(raw?.user?.style?.badges);
+  pushMany(raw?.user?.style?.badge);
+  pushMany(raw?.user?.cosmetics?.badges);
+  pushMany(raw?.user?.cosmetics?.badge);
+  pushMany(raw?.user?.badges);
+  pushMany(raw?.user?.badge);
+
+  for (const c of asArray(raw?.connections)) {
+    pushMany(c?.style?.badges);
+    pushMany(c?.style?.badge);
+    pushMany(c?.cosmetics?.badges);
+    pushMany(c?.cosmetics?.badge);
+    pushMany(c?.user?.style?.badges);
+    pushMany(c?.user?.style?.badge);
+  }
+
+  for (const ent of [
+    ...asArray(raw?.entitlements),
+    ...asArray(raw?.cosmetics?.entitlements),
+    ...asArray(raw?.user?.entitlements),
+  ]) {
+    const kind = String(ent?.kind ?? ent?.type ?? "").toLowerCase();
+    const data = ent?.data ?? ent?.object ?? ent?.item ?? ent?.cosmetic ?? ent;
+
+    if (kind.includes("badge")) {
+      pushMany(data?.badge ?? data?.badges ?? data);
+    } else {
+      pushMany(data?.badge);
+      pushMany(data?.badges);
+      pushMany(data?.style?.badge);
+      pushMany(data?.style?.badges);
+    }
+  }
+
+  return out.filter(Boolean);
+}
+
+async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<CosmeticsPayload> {
+  const url = `https://7tv.io/v3/users/twitch/${encodeURIComponent(twitchUserId)}`;
+
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json",
+    },
+  });
+
+  const rawText = await res.text();
+
+  let j: any = null;
+  try {
+    j = rawText ? JSON.parse(rawText) : null;
+  } catch (e: any) {
+    if (isDebug7tvUser(twitchUserId)) {
+      console.log(
+        "[7TV][PARSE_ERROR]",
+        JSON.stringify({
+          userId: twitchUserId,
+          status: res.status,
+          bodySnippet: rawText.slice(0, 400),
+          error: String(e?.message ?? e),
+        }),
+      );
+    }
+    throw new Error(`7tv parse failed ${res.status} ${url}`);
+  }
+
+  if (!res.ok) {
+    if (isDebug7tvUser(twitchUserId)) {
+      console.log(
+        "[7TV][HTTP_ERROR]",
+        JSON.stringify({
+          userId: twitchUserId,
+          status: res.status,
+          bodySnippet: rawText.slice(0, 400),
+        }),
+      );
+    }
+    throw new Error(`7tv user fetch failed ${res.status} ${url}`);
+  }
+
+  log7tvDebug(twitchUserId, "user-payload", j, { status: res.status });
+
+  let paint: PaintPayload = null;
+  for (const candidate of collectPaintCandidates(j)) {
+    paint = normalizePaintPayload(candidate);
+    if (paint) break;
+  }
+
+  const stvBadges: SevenTVBadge[] = [];
+  const seen = new Set<string>();
+
+  for (const badgeNode of collectBadgeCandidates(j)) {
+    const normalized = normalize7tvBadge(badgeNode);
+    if (!normalized) continue;
+
+    const dedupeKey = normalized.id || normalized.url;
+    if (!dedupeKey || seen.has(dedupeKey)) continue;
+
+    seen.add(dedupeKey);
+    stvBadges.push(normalized);
+  }
+
+  if (isDebug7tvUser(twitchUserId)) {
+    console.log(
+      "[7TV][PARSED]",
+      JSON.stringify({
+        userId: twitchUserId,
+        paintFound: !!paint,
+        badgeCount: stvBadges.length,
+        badgeNames: stvBadges.slice(0, 5).map((b) => b.name ?? b.tooltip ?? b.id ?? "badge"),
+      }),
+    );
   }
 
   return { paint, stvBadges };
@@ -386,18 +681,46 @@ async function ensureBadgesForChannel(channel: string, roomId?: string): Promise
 async function ensureCosmetics(userId: string): Promise<CosmeticsPayload> {
   const now = Date.now();
   const cached = cosmeticsCache.get(userId);
-  if (cached?.loadedAt && now - cached.loadedAt < COSMETICS_TTL_MS) return cached.data;
+  const debugUser = isDebug7tvUser(userId);
 
-  if (cosmeticsInflight.has(userId)) return cached?.data ?? { paint: null, stvBadges: [] };
+  // Debug-User bewusst NICHT aus TTL-Cache bedienen,
+  // damit du nach jedem Chat direkt neue 7TV-Logs bekommst.
+  if (!debugUser && cached?.loadedAt && now - cached.loadedAt < COSMETICS_TTL_MS) {
+    return cached.data;
+  }
+
+  if (cosmeticsInflight.has(userId)) {
+    return cached?.data ?? { paint: null, stvBadges: [] };
+  }
+
   cosmeticsInflight.add(userId);
 
   try {
     const data = await fetch7TVCosmeticsForTwitchUser(userId);
     cosmeticsCache.set(userId, { loadedAt: now, data });
     return data;
-  } catch {
+  } catch (e: any) {
+    const errMsg = String(e?.message ?? e);
+
+    if (debugUser || !cached) {
+      console.log(
+        "[7TV][COSMETICS_ERROR]",
+        JSON.stringify({
+          userId,
+          error: errMsg,
+        }),
+      );
+    }
+
     const fallback = cached?.data ?? { paint: null, stvBadges: [] };
-    cosmeticsCache.set(userId, { loadedAt: now, data: fallback });
+
+    // Für den Debug-User bei Fehler nicht “hart” cachen,
+    // damit der nächste Chat sofort neu versucht wird.
+    cosmeticsCache.set(userId, {
+      loadedAt: debugUser ? 0 : now,
+      data: fallback,
+    });
+
     return fallback;
   } finally {
     cosmeticsInflight.delete(userId);
@@ -778,8 +1101,25 @@ function connectTwitch(conn: TwitchConn) {
       const uidTag = tags["user-id"];
       if (uidTag) {
         void (async () => {
-          const data = await ensureCosmetics(String(uidTag));
-          broadcast(conn, { type: "cosmetics", user_id: String(uidTag), paint: data.paint, stvBadges: data.stvBadges });
+          const userId = String(uidTag);
+          const data = await ensureCosmetics(userId);
+
+          broadcast(conn, {
+            type: "cosmetics",
+            user_id: userId,
+            paint: data.paint,
+            stvBadges: data.stvBadges,
+          });
+
+          if (isDebug7tvUser(userId) && DEBUG_7TV_WS && process.env.NODE_ENV !== "production") {
+            broadcast(conn, {
+              type: "debug_7tv",
+              user_id: userId,
+              paintFound: !!data.paint,
+              stvBadgeCount: data.stvBadges.length,
+              badgeNames: data.stvBadges.slice(0, 5).map((b) => b.name ?? b.tooltip ?? b.id ?? "badge"),
+            });
+          }
         })();
       }
     }
