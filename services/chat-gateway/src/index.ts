@@ -767,11 +767,25 @@ server.on("error", (err) => console.error("[chat-gateway] server error", err));
 
 // ---------- ONE WS server + path routing ----------
 const wss = new WebSocketServer({ noServer: true });
+const hb = setInterval(() => {
+  for (const ws of wss.clients) {
+    const anyWs: any = ws as any;
+    if (anyWs.isAlive === false) {
+      try { ws.terminate(); } catch { }
+      continue;
+    }
+    anyWs.isAlive = false;
+    try { ws.ping(); } catch { }
+  }
+}, 25_000);
+
+wss.on("close", () => clearInterval(hb));
 
 server.on("upgrade", (req, socket, head) => {
   try {
     const u = new URL(req.url ?? "", "http://localhost");
     const p = u.pathname;
+    console.log("[upgrade]", p, String(u.searchParams.get("channel") ?? ""), String(u.searchParams.get("profileId") ?? ""));
     if (p !== "/ws" && p !== "/ws/chat") {
       socket.destroy();
       return;
@@ -788,6 +802,20 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", async (socket, req) => {
   const u = new URL(req.url ?? "", "http://localhost");
   const p = u.pathname;
+
+  (socket as any).isAlive = true;
+
+  (socket as any).on("pong", () => {
+    (socket as any).isAlive = true;
+  });
+
+  // optional: Antworten auf simple "ping" Textmessage (dein Client sendet "ping")
+  (socket as any).on("message", (raw: RawData) => {
+    const s = raw.toString();
+    if (s === "ping") {
+      sendJSON(socket as any, { type: "echo", raw: "ping" });
+    }
+  });
 
   // ---- /ws (debug) ----
   if (p === "/ws") {
@@ -847,9 +875,12 @@ wss.on("connection", async (socket, req) => {
     }
 
     // default mode (editor preview)
-    const channel = TWITCH_DEFAULT_CHANNEL;
+    const requested = String(u.searchParams.get("channel") ?? "").trim().toLowerCase();
+    const requestedClean = requested.replace(/^#/, "").replace(/[^a-z0-9_]/g, "");
+    const channel = requestedClean || TWITCH_DEFAULT_CHANNEL;
+
     if (!channel) {
-      sendJSON(socket as any, { type: "error", msg: "no profileId/key and no TWITCH_DEFAULT_CHANNEL set" });
+      sendJSON(socket as any, { type: "error", msg: "no profileId/key and no channel param and no TWITCH_DEFAULT_CHANNEL set" });
       (socket as any).close();
       return;
     }
