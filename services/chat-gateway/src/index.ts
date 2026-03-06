@@ -765,8 +765,10 @@ function start7tvDebugEventStream(opts: {
 
       const subs = [
         { type: "user.update", condition: { object_id: hostId } },
-        { type: "entitlement.*", condition: { host_id: hostId, connection_id: connectionId } },
-        { type: "cosmetic.*", condition: { host_id: hostId, connection_id: connectionId } },
+
+        // DEBUG: erst ungefiltert testen, um zu sehen, ob die Typen überhaupt sauber ACKen
+        { type: "entitlement.*" },
+        { type: "cosmetic.*" },
       ];
 
       for (const sub of subs) {
@@ -798,6 +800,8 @@ function start7tvDebugEventStream(opts: {
         "[7TV][EV_ACK]",
         JSON.stringify({
           userId: opts.debugUserId,
+          ackType: msg?.d?.data?.type ?? null,
+          ackCondition: msg?.d?.data?.condition ?? null,
           ack: msg?.d ?? null,
         }),
       );
