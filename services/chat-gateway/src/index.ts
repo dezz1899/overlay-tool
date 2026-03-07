@@ -1122,6 +1122,20 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
     "",
   ).trim();
 
+  if (isDebug7tvUser(twitchUserId)) {
+    if (stylePaintId) debug7tvTargetPaintId = stylePaintId;
+    if (styleBadgeId) debug7tvTargetBadgeId = styleBadgeId;
+
+    console.log(
+      "[7TV][TARGET_IDS]",
+      JSON.stringify({
+        userId: twitchUserId,
+        stylePaintId: stylePaintId || null,
+        styleBadgeId: styleBadgeId || null,
+      }),
+    );
+  }
+
   const sevenTvUserId = String(
     j?.user?.id ??
     j?.id ??
@@ -1211,40 +1225,37 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
   }
 
   if (!paint && stylePaintId) {
-    for (const source of [jById, j]) {
-      if (!source) continue;
+    const cachedCosmetic = sevenTvCosmeticById.get(stylePaintId);
 
-      const deepMatches = findObjectsByIdDeep(source, stylePaintId);
+    if (cachedCosmetic) {
+      paint =
+        normalizePaintPayload(cachedCosmetic?.data) ||
+        normalizePaintPayload(cachedCosmetic);
 
-      if (isDebug7tvUser(twitchUserId) && deepMatches.length > 0) {
+      if (isDebug7tvUser(twitchUserId)) {
         console.log(
-          "[7TV][PAINT_ID_DEEP_MATCHES]",
+          "[7TV][PAINT_CACHE_LOOKUP]",
           JSON.stringify({
             userId: twitchUserId,
             stylePaintId,
-            count: deepMatches.length,
-            samples: deepMatches.slice(0, 5).map((x: any) => ({
-              keys: objectKeys(x),
-              id: x?.id ?? null,
-              kind: x?.kind ?? x?.type ?? null,
-            })),
+            found: !!paint,
+            cacheKeys: objectKeys(cachedCosmetic),
+            dataKeys: objectKeys(cachedCosmetic?.data),
           }),
         );
       }
-
-      for (const match of deepMatches) {
-        paint =
-          normalizePaintPayload(match) ||
-          normalizePaintPayload(match?.data) ||
-          normalizePaintPayload(match?.paint) ||
-          normalizePaintPayload(match?.style?.paint) ||
-          null;
-
-        if (paint) break;
-      }
-
-      if (paint) break;
     }
+  }
+
+  if (!paint && stylePaintId && isDebug7tvUser(twitchUserId)) {
+    console.log(
+      "[7TV][PAINT_NEEDS_EVENT_OBJECT]",
+      JSON.stringify({
+        userId: twitchUserId,
+        stylePaintId,
+        cacheHit: sevenTvCosmeticById.has(stylePaintId),
+      }),
+    );
   }
 
   const stvBadges: SevenTVBadge[] = [];
@@ -1265,7 +1276,35 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
     }
   }
 
-  // Fallback: Badge direkt über CDN bauen, genau wie in deinem ChatIS-Screenshot
+  if (stvBadges.length === 0 && styleBadgeId) {
+    const cachedCosmetic = sevenTvCosmeticById.get(styleBadgeId);
+    const cachedBadge =
+      normalize7tvBadge(cachedCosmetic?.data) ||
+      normalize7tvBadge(cachedCosmetic);
+
+    if (cachedBadge) {
+      const dedupeKey = cachedBadge.id || cachedBadge.url;
+      if (dedupeKey && !seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        stvBadges.push(cachedBadge);
+      }
+
+      if (isDebug7tvUser(twitchUserId)) {
+        console.log(
+          "[7TV][BADGE_CACHE_LOOKUP]",
+          JSON.stringify({
+            userId: twitchUserId,
+            badgeId: styleBadgeId,
+            found: true,
+            cacheKeys: objectKeys(cachedCosmetic),
+            dataKeys: objectKeys(cachedCosmetic?.data),
+          }),
+        );
+      }
+    }
+  }
+
+  // Fallback: Badge direkt über CDN bauen
   if (stvBadges.length === 0 && styleBadgeId) {
     const fallbackUrl = build7tvBadgeCdnUrl(styleBadgeId, "3x");
     if (fallbackUrl) {
@@ -1554,6 +1593,11 @@ const channelBadges = new Map<string, { loadedAt: number; map: BadgeMap; roomId?
 const cosmeticsCache = new Map<string, { loadedAt: number; data: CosmeticsPayload }>();
 const cosmeticsInflight = new Set<string>();
 const COSMETICS_TTL_MS = Math.max(60_000, Number(process.env.COSMETICS_TTL_MS ?? 10 * 60 * 1000));
+
+const sevenTvCosmeticById = new Map<string, any>();
+
+let debug7tvTargetPaintId = "";
+let debug7tvTargetBadgeId = "";
 
 let sevenTvDebugEventsWs: WebSocket | null = null;
 let sevenTvDebugEventsKey = "";
@@ -1962,56 +2006,74 @@ function start7tvChannelEventDebug(conn: TwitchConn) {
       const type = String(msg?.d?.type ?? "");
       const body = msg?.d?.body ?? {};
       const obj = body?.object ?? null;
+      const objectId = String(obj?.id ?? "").trim();
+      const objectKind = String(obj?.kind ?? "").trim();
 
-      if (type === "cosmetic.create" || type === "entitlement.create") {
+      if (type === "cosmetic.create" && objectId) {
+        sevenTvCosmeticById.set(objectId, obj);
+
         const paintCandidate = normalizePaintPayload(obj?.data);
         const badgeCandidate = normalize7tvBadge(obj?.data);
 
+        const isTargetHit =
+          objectId === debug7tvTargetPaintId ||
+          objectId === debug7tvTargetBadgeId;
+
         console.log(
-          "[7TV][EV_CH_OBJECT]",
+          "[7TV][EV_CH_COSMETIC_CACHE]",
           JSON.stringify({
             channel: conn.channel,
-            type,
-            objectId: obj?.id ?? null,
-            objectKind: obj?.kind ?? null,
-            refId: obj?.ref_id ?? null,
-
-            dataKeys: objectKeys(obj?.data, 30),
+            objectId,
+            objectKind,
+            isTargetHit,
             paintParsed: !!paintCandidate,
             paintFunction: paintCandidate?.function ?? null,
             paintImageUrl: paintCandidate?.image_url ?? null,
             paintStopCount: Array.isArray(paintCandidate?.stops) ? paintCandidate.stops.length : 0,
-
             badgeParsed: !!badgeCandidate,
             badgeUrl: badgeCandidate?.url ?? null,
+          }),
+        );
 
-            userSummary: Array.isArray(obj?.user)
-              ? obj.user.slice(0, 5).map((u: any) => ({
-                id: u?.id ?? null,
-                username: u?.username ?? null,
-                connectionIds: Array.isArray(u?.connections)
-                  ? u.connections.map((c: any) => c?.id ?? null).slice(0, 5)
-                  : [],
-                connectionPlatforms: Array.isArray(u?.connections)
-                  ? u.connections.map((c: any) => c?.platform ?? null).slice(0, 5)
-                  : [],
-              }))
-              : obj?.user
-                ? {
-                  id: obj?.user?.id ?? null,
-                  username: obj?.user?.username ?? null,
-                  connectionIds: Array.isArray(obj?.user?.connections)
-                    ? obj.user.connections.map((c: any) => c?.id ?? null).slice(0, 5)
-                    : [],
-                  connectionPlatforms: Array.isArray(obj?.user?.connections)
-                    ? obj.user.connections.map((c: any) => c?.platform ?? null).slice(0, 5)
-                    : [],
-                }
-                : null,
+        if (isTargetHit) {
+          console.log(
+            "[7TV][EV_CH_TARGET_COSMETIC]",
+            JSON.stringify({
+              channel: conn.channel,
+              targetType: objectId === debug7tvTargetPaintId ? "paint" : "badge",
+              object: obj,
+            }),
+          );
+        }
 
+        return;
+      }
+
+      if (type === "entitlement.create" && objectKind !== "EMOTE_SET") {
+        console.log(
+          "[7TV][EV_CH_ENTITLEMENT]",
+          JSON.stringify({
+            channel: conn.channel,
+            objectId,
+            objectKind,
+            refId: obj?.ref_id ?? null,
+            userSummary: obj?.user
+              ? {
+                id: obj?.user?.id ?? null,
+                username: obj?.user?.username ?? null,
+                style: obj?.user?.style ?? null,
+                connectionIds: Array.isArray(obj?.user?.connections)
+                  ? obj.user.connections.map((c: any) => c?.id ?? null).slice(0, 5)
+                  : [],
+                connectionPlatforms: Array.isArray(obj?.user?.connections)
+                  ? obj.user.connections.map((c: any) => c?.platform ?? null).slice(0, 5)
+                  : [],
+              }
+              : null,
             object: obj,
           }),
         );
+        return;
       }
 
       return;
