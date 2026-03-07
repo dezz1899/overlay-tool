@@ -1949,13 +1949,71 @@ function start7tvChannelEventDebug(conn: TwitchConn) {
     }
 
     if (op === 0) {
+      const summary = summarize7tvDispatch(msg);
+
       console.log(
         "[7TV][EV_CH_DISPATCH]",
         JSON.stringify({
           channel: conn.channel,
-          summary: summarize7tvDispatch(msg),
+          summary,
         }),
       );
+
+      const type = String(msg?.d?.type ?? "");
+      const body = msg?.d?.body ?? {};
+      const obj = body?.object ?? null;
+
+      if (type === "cosmetic.create" || type === "entitlement.create") {
+        const paintCandidate = normalizePaintPayload(obj?.data);
+        const badgeCandidate = normalize7tvBadge(obj?.data);
+
+        console.log(
+          "[7TV][EV_CH_OBJECT]",
+          JSON.stringify({
+            channel: conn.channel,
+            type,
+            objectId: obj?.id ?? null,
+            objectKind: obj?.kind ?? null,
+            refId: obj?.ref_id ?? null,
+
+            dataKeys: objectKeys(obj?.data, 30),
+            paintParsed: !!paintCandidate,
+            paintFunction: paintCandidate?.function ?? null,
+            paintImageUrl: paintCandidate?.image_url ?? null,
+            paintStopCount: Array.isArray(paintCandidate?.stops) ? paintCandidate.stops.length : 0,
+
+            badgeParsed: !!badgeCandidate,
+            badgeUrl: badgeCandidate?.url ?? null,
+
+            userSummary: Array.isArray(obj?.user)
+              ? obj.user.slice(0, 5).map((u: any) => ({
+                id: u?.id ?? null,
+                username: u?.username ?? null,
+                connectionIds: Array.isArray(u?.connections)
+                  ? u.connections.map((c: any) => c?.id ?? null).slice(0, 5)
+                  : [],
+                connectionPlatforms: Array.isArray(u?.connections)
+                  ? u.connections.map((c: any) => c?.platform ?? null).slice(0, 5)
+                  : [],
+              }))
+              : obj?.user
+                ? {
+                  id: obj?.user?.id ?? null,
+                  username: obj?.user?.username ?? null,
+                  connectionIds: Array.isArray(obj?.user?.connections)
+                    ? obj.user.connections.map((c: any) => c?.id ?? null).slice(0, 5)
+                    : [],
+                  connectionPlatforms: Array.isArray(obj?.user?.connections)
+                    ? obj.user.connections.map((c: any) => c?.platform ?? null).slice(0, 5)
+                    : [],
+                }
+                : null,
+
+            object: obj,
+          }),
+        );
+      }
+
       return;
     }
   });
