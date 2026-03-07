@@ -49,13 +49,31 @@ type EmoteEntry = { url: string; provider: ExtProvider };
 type EmoteMap = Record<string, EmoteEntry>;
 type BadgeMap = Record<string, string>; // "set/version" -> image_url_2x
 
+type PaintStop = {
+  at: number;
+  color: number; // packed int, wie bei 7TV / ChatIS
+};
+
+type PaintShadow = {
+  x_offset: number;
+  y_offset: number;
+  radius: number;
+  color: number; // packed int
+};
+
 type PaintPayload =
   | null
   | {
-    kind: "linear";
-    angle: number;
-    stops: { at: number; color: string }[];
-    shadow?: string;
+    id?: string;
+    function: "linear-gradient" | "radial-gradient" | "url";
+    angle?: number;
+    shape?: string;
+    repeat?: boolean;
+    stops?: PaintStop[];
+    image_url?: string;
+    color?: number;
+    shadows?: PaintShadow[];
+    drop_shadow?: PaintShadow;
   };
 
 type SevenTVBadge = {
@@ -86,6 +104,9 @@ type TwitchConn = {
   assets?: EmoteMap;
   assetsLoadedAt?: number;
   assetsLoading?: boolean;
+
+  stvEventWs?: WebSocket | null;
+  stvEventKey?: string;
 };
 
 // ---------- helpers ----------
@@ -115,6 +136,12 @@ function stopConnIfIdle(conn: TwitchConn) {
     conn.irc?.close();
   } catch { }
   conn.irc = null;
+
+  try {
+    conn.stvEventWs?.close();
+  } catch { }
+  conn.stvEventWs = null;
+  conn.stvEventKey = undefined;
 
   if (conn.pollTimer) {
     clearInterval(conn.pollTimer);
@@ -275,39 +302,106 @@ function log7tvDebug(userId: string, stage: string, raw: any, extra: Record<stri
   );
 }
 
-function normalizePaintPayload(paintObj: any): PaintPayload {
-  if (!paintObj) return null;
+function normalizePackedColorInt(value: any): number | null {
+  if (value == null) return null;
 
-  const angle = Number(paintObj?.angle ?? 0);
-  const stopsRaw = paintObj?.gradient?.stops || paintObj?.stops || null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value >>> 0;
+  }
 
-  const stops: { at: number; color: string }[] = Array.isArray(stopsRaw)
-    ? stopsRaw
-      .map((s: any) => ({
-        at: Math.max(0, Math.min(1, Number(s?.at ?? s?.position ?? 0))),
-        color: String(s?.color ?? s?.value ?? ""),
-      }))
-      .filter((s: any) => s.color)
-    : [];
+  const s = String(value).trim();
+  if (!s) return null;
 
-  const single = String(paintObj?.color ?? "");
-  const normalizedStops =
-    stops.length > 0
-      ? stops
-      : single
-        ? [{ at: 0, color: single }, { at: 1, color: single }]
-        : [];
+  if (/^[0-9]+$/.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n)) return n >>> 0;
+  }
 
-  if (normalizedStops.length === 0) return null;
+  return null;
+}
 
-  const shadowColor = String(paintObj?.shadow_color ?? paintObj?.shadowColor ?? "");
-  const shadow = shadowColor ? `0 0 10px ${shadowColor}` : undefined;
+function normalizePaintShadow(sh: any): PaintShadow | null {
+  if (!sh) return null;
+
+  const color = normalizePackedColorInt(sh?.color);
+  const x_offset = Number(sh?.x_offset ?? sh?.xOffset ?? 0);
+  const y_offset = Number(sh?.y_offset ?? sh?.yOffset ?? 0);
+  const radius = Number(sh?.radius ?? 0);
+
+  if (color == null) return null;
 
   return {
-    kind: "linear",
-    angle: Number.isFinite(angle) ? angle : 0,
-    stops: normalizedStops,
-    shadow,
+    x_offset: Number.isFinite(x_offset) ? x_offset : 0,
+    y_offset: Number.isFinite(y_offset) ? y_offset : 0,
+    radius: Number.isFinite(radius) ? radius : 0,
+    color,
+  };
+}
+
+function normalizePaintPayload(paintObj: any): PaintPayload {
+  const p = paintObj?.paint ?? paintObj;
+  if (!p || typeof p !== "object") return null;
+
+  const fnRaw = String(p?.function ?? p?.kind ?? "").trim();
+  let fn: NonNullable<PaintPayload>["function"] | null = null;
+
+  switch (fnRaw) {
+    case "LINEAR_GRADIENT":
+    case "linear-gradient":
+      fn = "linear-gradient";
+      break;
+    case "RADIAL_GRADIENT":
+    case "radial-gradient":
+      fn = "radial-gradient";
+      break;
+    case "URL":
+    case "url":
+      fn = "url";
+      break;
+    default:
+      return null;
+  }
+
+  const color = normalizePackedColorInt(p?.color) ?? undefined;
+
+  const stops: PaintStop[] | undefined = Array.isArray(p?.stops)
+    ? p.stops
+      .map((s: any) => {
+        const at = Number(s?.at ?? 0);
+        const col = normalizePackedColorInt(s?.color);
+        if (col == null) return null;
+        return {
+          at: Math.max(0, Math.min(1, Number.isFinite(at) ? at : 0)),
+          color: col,
+        };
+      })
+      .filter(Boolean) as PaintStop[]
+    : undefined;
+
+  const shadows: PaintShadow[] | undefined = Array.isArray(p?.shadows)
+    ? p.shadows.map(normalizePaintShadow).filter(Boolean) as PaintShadow[]
+    : undefined;
+
+  const drop_shadow = normalizePaintShadow(p?.drop_shadow ?? p?.dropShadow) ?? undefined;
+
+  const image_url =
+    fn === "url"
+      ? httpsify(String(p?.image_url ?? p?.imageUrl ?? p?.url ?? ""))
+      : undefined;
+
+  if (fn === "url" && !image_url) return null;
+
+  return {
+    id: p?.id ? String(p.id) : undefined,
+    function: fn,
+    angle: fn === "linear-gradient" ? Number(p?.angle ?? 0) : undefined,
+    shape: fn === "radial-gradient" ? String(p?.shape ?? "circle") : undefined,
+    repeat: !!p?.repeat,
+    stops: stops && stops.length > 0 ? stops : undefined,
+    image_url: image_url || undefined,
+    color,
+    shadows: shadows && shadows.length > 0 ? shadows : undefined,
+    drop_shadow,
   };
 }
 
@@ -1101,13 +1195,7 @@ async function fetch7TVCosmeticsForTwitchUser(twitchUserId: string): Promise<Cos
     );
   }
 
-  const debugConn = pickDebug7tvConnection(j, twitchUserId);
-
-  start7tvDebugEventStream({
-    debugUserId: twitchUserId,
-    hostIdCandidate: String(j?.user?.id ?? "").trim() || null,
-    connectionIdCandidate: String(debugConn?.id ?? "").trim() || null,
-  });
+  // moved: 7TV EventAPI debug must be started channel-scoped from TwitchConn once conn.twitchId is known
 
   let paint: PaintPayload = null;
 
@@ -1715,6 +1803,191 @@ async function broadcastAssets(conn: TwitchConn) {
 // ---------- twitch IRC ----------
 const conns = new Map<string, TwitchConn>();
 
+function summarize7tvDispatch(msg: any) {
+  const body = msg?.d?.body ?? {};
+
+  const mapOps = (arr: any) =>
+    Array.isArray(arr)
+      ? arr.slice(0, 8).map((x: any) => ({
+        key: x?.key ?? null,
+        index: x?.index ?? null,
+        nested: !!x?.nested,
+        valueKeys: objectKeys(x?.value, 12),
+        oldValueKeys: objectKeys(x?.old_value, 12),
+        value: x?.value ?? null,
+      }))
+      : [];
+
+  return {
+    type: msg?.d?.type ?? null,
+    bodyKeys: objectKeys(body, 20),
+    objectKeys: objectKeys(body?.object, 20),
+    actorKeys: objectKeys(body?.actor, 20),
+    added: mapOps(body?.added),
+    updated: mapOps(body?.updated),
+    removed: mapOps(body?.removed),
+    pushed: mapOps(body?.pushed),
+    pulled: mapOps(body?.pulled),
+  };
+}
+
+function start7tvChannelEventDebug(conn: TwitchConn) {
+  if (!DEBUG_7TV_EVENTS) return;
+  if (!conn.twitchId) return;
+
+  const eventKey = String(conn.twitchId);
+  const existing = conn.stvEventWs;
+
+  if (
+    existing &&
+    conn.stvEventKey === eventKey &&
+    (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)
+  ) {
+    return;
+  }
+
+  if (existing) {
+    try { existing.close(); } catch { }
+    conn.stvEventWs = null;
+    conn.stvEventKey = undefined;
+  }
+
+  const ev = new WebSocket("wss://events.7tv.io/v3");
+  conn.stvEventWs = ev;
+  conn.stvEventKey = eventKey;
+
+  ev.on("open", () => {
+    console.log(
+      "[7TV][EV_CH_OPEN]",
+      JSON.stringify({
+        channel: conn.channel,
+        twitchId: conn.twitchId,
+      }),
+    );
+  });
+
+  ev.on("message", (raw: RawData) => {
+    let msg: any = null;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch (e: any) {
+      console.log(
+        "[7TV][EV_CH_PARSE_ERROR]",
+        JSON.stringify({
+          channel: conn.channel,
+          error: String(e?.message ?? e),
+          raw: String(raw).slice(0, 300),
+        }),
+      );
+      return;
+    }
+
+    const op = Number(msg?.op ?? -1);
+
+    if (op === 1) {
+      const subs = [
+        { type: "entitlement.*", condition: { platform: "TWITCH", ctx: "channel", id: conn.twitchId } },
+        { type: "cosmetic.*", condition: { platform: "TWITCH", ctx: "channel", id: conn.twitchId } },
+        { type: "emote_set.*", condition: { platform: "TWITCH", ctx: "channel", id: conn.twitchId } },
+      ];
+
+      console.log(
+        "[7TV][EV_CH_HELLO]",
+        JSON.stringify({
+          channel: conn.channel,
+          twitchId: conn.twitchId,
+          hello: msg?.d ?? null,
+        }),
+      );
+
+      for (const sub of subs) {
+        try {
+          ev.send(JSON.stringify({ op: 35, d: sub }));
+          console.log(
+            "[7TV][EV_CH_SUB_SENT]",
+            JSON.stringify({
+              channel: conn.channel,
+              sub,
+            }),
+          );
+        } catch (e: any) {
+          console.log(
+            "[7TV][EV_CH_SUB_SEND_ERROR]",
+            JSON.stringify({
+              channel: conn.channel,
+              sub,
+              error: String(e?.message ?? e),
+            }),
+          );
+        }
+      }
+      return;
+    }
+
+    if (op === 5) {
+      console.log(
+        "[7TV][EV_CH_ACK]",
+        JSON.stringify({
+          channel: conn.channel,
+          ackType: msg?.d?.data?.type ?? null,
+          ackCondition: msg?.d?.data?.condition ?? null,
+          ack: msg?.d ?? null,
+        }),
+      );
+      return;
+    }
+
+    if (op === 6) {
+      console.log(
+        "[7TV][EV_CH_ERROR]",
+        JSON.stringify({
+          channel: conn.channel,
+          error: msg?.d ?? null,
+        }),
+      );
+      return;
+    }
+
+    if (op === 0) {
+      console.log(
+        "[7TV][EV_CH_DISPATCH]",
+        JSON.stringify({
+          channel: conn.channel,
+          summary: summarize7tvDispatch(msg),
+        }),
+      );
+      return;
+    }
+  });
+
+  ev.on("close", (code, reason) => {
+    console.log(
+      "[7TV][EV_CH_CLOSED]",
+      JSON.stringify({
+        channel: conn.channel,
+        code,
+        reason: String(reason || ""),
+      }),
+    );
+    if (conn.stvEventWs === ev) {
+      conn.stvEventWs = null;
+      conn.stvEventKey = undefined;
+    }
+  });
+
+  ev.on("error", (err: any) => {
+    console.log(
+      "[7TV][EV_CH_SOCKET_ERROR]",
+      JSON.stringify({
+        channel: conn.channel,
+        error: String(err?.message ?? err),
+      }),
+    );
+  });
+}
+
+
+
 function connectTwitch(conn: TwitchConn) {
   if (conn.connecting || conn.closed) return;
   conn.connecting = true;
@@ -1779,6 +2052,7 @@ function connectTwitch(conn: TwitchConn) {
       if (roomId && !conn.twitchId) {
         conn.twitchId = String(roomId);
         void broadcastAssets(conn);
+        start7tvChannelEventDebug(conn);
       }
 
       if (!rest.includes("PRIVMSG")) continue;
